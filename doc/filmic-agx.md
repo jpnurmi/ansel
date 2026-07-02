@@ -524,24 +524,28 @@ compile-time switch was deleted; the minimax fit lives on as the script's
 
 ## Runtime adaptation to the actual curve (assessed, deferred)
 
-The anchors are fitted against the *default* curve, and the fit showed the
-coupling is real: what the bracket does depends on the shoulder length in EV
-(dynamic range × latitude split), which the user changes per image. Assessment:
+The anchors were fitted against the *default* curve, but users reshape the
+curve on every image (dynamic range, latitude, contrast). How much does that
+mismatch matter, and should the matrices adapt to the user's actual curve?
+Two options were assessed:
 
-- **Full runtime re-fit: rejected.** The fitting objective needed hand-shaped
-  counterweights to avoid railing (see above) — an unsupervised optimizer does
-  not belong in `commit_params`. It would also make hue rendering shift while
-  dragging contrast, and land in different local minima for different curve
-  configurations, so the same slider value would mean different colors.
-- **1-D deterministic adaptation along the fitted ray: worthwhile, deferred.**
-  Because positivity/conditioning hold along the ray, a scalar `t_auto` can be
-  derived from the actual spline at commit time — either closed-form
-  (`t_auto ≈ reference_shoulder_EV / actual_shoulder_EV`, clamped to [0.5, 2])
-  or by a ~20-evaluation bisection on a probe color through the actual curve —
-  and composed with the user slider (`t = t_auto · t_user`). Deterministic,
-  smooth in the params, microsecond-cheap. Since the gamut mapper owns the
-  endpoint anyway, the residual mismatch is second-order; implement only if
-  visual testing on short-DR edits shows late/abrupt bleaching.
+- **Re-running the full fit at runtime: rejected.** The fitting sessions above
+  showed the objective only behaves when hand-shaped counterweights keep it
+  from railing — an optimizer that needs supervision has no business running
+  unattended inside `commit_params`. It would also make color rendering
+  wander while the user drags the contrast slider, and settle into different
+  local minima for different curve setups — the same slider position would
+  mean different colors on different images. Unacceptable for predictability.
+- **A single self-adjusting strength factor: worthwhile, deferred.** The safe
+  middle ground: keep the fitted matrix *shape* and only auto-scale its
+  *strength* to the actual curve. Because validity (constraints 2 and 3) holds
+  along the whole strength axis, a scalar `t_auto` can be computed cheaply
+  when parameters change — either from a simple ratio (fitted shoulder length
+  vs. actual shoulder length, in EV) or by probing ~20 curve evaluations —
+  then multiplied into the user's slider value. Deterministic, smooth, no
+  optimizer. Since the gamut mapper owns the near-white endpoint anyway, the
+  residual mismatch is a second-order effect: implement this only if edits
+  with small dynamic ranges visibly bleach too late or too abruptly.
 
 ## Future user parameters (only if demonstrated necessary)
 
@@ -578,75 +582,99 @@ bar is "users demonstrate a real limitation", not "would be nice".
 
 The anchors are fitted against the default curve, which raised the obvious
 question: where does the *default curve* come from? Historically: taste. It is
-however a solvable problem — the tone curve is the luminance mapping between
-two known viewing states, so `tools/derive_filmic_default_curve.py` computes it
-as an appearance match: CIECAM16 lightness J of the scene state (diffuse white
-~1000 cd/m², observer adapted, average surround, no flare) matched to the
-display state (SDR ~100 cd/m², dim surround, veiling flare 0.5% of white),
-then the curve family least-squares fitted onto the match with a content-mass
-prior and a **JND-visibility term** (the rendering may not introduce
-perceptual-lightness curvature d²J/dEV² sharper than the match itself contains
-anywhere). The curve model replicates the C v3 geometry *exactly* — including
-the DR/8 normalization and gamma compensation of the user contrast — so fitted
-values are directly the module's parameters.
+however a solvable problem, because a tone curve is secretly an answer to a
+physical question: *"this patch of the scene had luminance X — what luminance
+should the display emit so that it __looks__ the same to the viewer?"* The
+scene is bright and the viewer is adapted to daylight; the display is ~10×
+dimmer, sits in a dim room, and reflects some stray light. Those are known,
+stateable conditions, and CIECAM16 exists precisely to predict perceived
+lightness under given conditions. So `tools/derive_filmic_default_curve.py`
+computes, for every exposure level, the display luminance whose *perceived*
+lightness matches the scene's (scene: diffuse white ~1000 cd/m², average
+surround → display: 100 cd/m², dim surround, 0.1% veiling flare — see the
+flare finding below), then finds the filmic curve parameters that best
+reproduce that mapping. Two weights steer the fit: exposures where photographs
+actually hold detail count more, and a **JND term** forbids the curve from
+introducing perceptual transitions sharper than the ideal mapping itself has
+anywhere — that is what keeps the roll-offs from turning into visible cliffs.
+The Python curve model replicates the C geometry *exactly*, including the
+internal renormalizations of the contrast slider, so the fitted values are
+directly the module's user parameters.
+
+A recurring measurement below is the **shadow slope**: how many stops the
+display output changes per stop of scene exposure, at a given point of the
+range. Slope 1 means shadow gradations are fully preserved; slope near 0 means
+whole stops of scene detail collapse into nothing on screen — that is what
+"crushed blacks" measures.
 
 Results (2026-07), stable across scene 1000→5000 cd/m², display 100→200 cd/m²
 and JND weights 1–3:
 
-- The method self-validates: fitted end-to-end log-log midtone slope 1.16 ≈
-  Bartleson–Breneman dim-surround compensation, never given to the harness.
-- **The shipped contrast 1.18 is confirmed to three digits** (fit: 1.178–1.189).
-  A first-pass model that skipped the DR/8+gamma normalization wrongly reported
-  the shipped default as "flatter than neutral (0.889)" — retracted; the actual
-  spline slope of the shipped default is 1.53, exactly what the appearance
-  match asks for. The historically hand-tuned value was already the
-  appearance-correct one; it now has a derivation.
-- **Under spline v4, the latitude is a tension control and belongs in the fit.**
-  An earlier revision of this doc called latitude/balance "editing-ergonomics
-  conventions, not appearance-derivable" and fixed them at 33%/0 — retracted
-  (maintainer correction, 2026-07). Small latitude hands the whole transition to
-  the sigmoids (soft, global curve); large latitude forces them into short, hard
-  turns: it participates in the contrast-transition strength exactly like the
-  sigmoid powers. The CIECAM16 match has no linear segment (cone compression is
-  smooth everywhere), and a fit started near zero latitude confirms it: the
-  **latitude converges to ~0** (cost flat below 2%, ship 1%), and the **balance
-  is unidentified there** (its translation is proportional to the latitude span;
-  Δcost 0.007% over its full range — ship 0).
+- **The method validates itself.** The fitted curve's mid-tone slope comes out
+  at ≈1.16 — textbooks (Bartleson–Breneman, 1967) say images viewed in a dim
+  surround need their contrast raised by ≈1.2× to look right, and the harness
+  rediscovered that number without ever being told it.
+- **The shipped contrast 1.18 is confirmed to three digits** (fit:
+  1.178–1.189). Embarrassing detour worth recording: a first-pass model
+  ignored that the module internally rescales the contrast slider, wrongly
+  concluded the shipped default was "flatter than neutral", and was retracted
+  once the model replicated the C geometry exactly. The historically
+  hand-tuned value was already the appearance-correct one; it now has a
+  derivation instead of a reputation.
+- **Under spline v4, the latitude is a tension control and belongs in the
+  fit.** An earlier revision of this doc declared latitude and balance
+  "editing-ergonomics conventions, not derivable" and pinned them at 33%/0 —
+  retracted after a maintainer correction (2026-07). With sigmoid segments,
+  a small latitude hands the whole curve to the smooth roll-offs (soft,
+  progressive transitions) while a large one forces short, hard turns — so the
+  latitude shapes the transition strength exactly like the sigmoid exponents
+  do, and must be fitted with them. The perceptual ideal mapping has no
+  straight segment anywhere (human brightness perception is smoothly
+  compressive), and the fit agrees: started near zero, the latitude stays
+  there, and the balance stops mattering at all at small latitudes (its effect
+  is proportional to the latitude's width; over its whole range it changes the
+  fit error by 0.007% — so it ships at its neutral 0).
 - **The JND tolerance must be local, not global** (first shadow-crush fix,
-  2026-07). The first formulation bounded the rendering's curvature by the
-  *global* maximum of the match's own curvature — which sits in the scene's
-  deep-shadow compression (~22 J/EV²), so the toe could turn arbitrarily hard
-  without penalty (toe-side curvature 5 vs tolerance 22: the term never bound).
-  Measured crush: log-log shadow slope 0.16 at −7 EV. The tolerance is now
-  per-exposure (match curvature at the same EV + 1 J/EV² margin).
+  2026-07). The "no transitions sharper than the ideal mapping" rule was first
+  implemented against the *sharpest transition anywhere* in the ideal mapping
+  — which happens to sit in the deep shadows and is quite sharp. Measured
+  against that lax ceiling, the toe never triggered the penalty at all and the
+  optimizer crushed the blacks for free: shadow slope 0.16 at −7 EV, i.e. a
+  full stop of scene detail squeezed into a sliver of output. The rule now
+  compares like with like — the curve's sharpness *at each exposure* against
+  the ideal mapping's sharpness *at that same exposure* — and bites on both
+  ends of the curve.
 - **The flare assumption owns the toe** (second shadow-crush fix, 2026-07 —
-  still "a bit crushing" after the local-JND fix). Two structural facts: the
-  hardness/gamma function alone imposes log-log slope 4.0 at −6.5 EV (a
-  *straight* spline is far from a shadow no-op — the toe's actual job is to
-  counteract the gamma), and the model considers shadow differences below the
-  veiling-flare floor invisible, so at 0.5% office flare, crushing below −4 EV
-  is free. The default fit now assumes **demanding viewing (0.1% flare, dim
-  room)**: safe toe converges to **1.5 — the AgX heritage value recovered from
-  first principles** — and the latitude rises to **~10%, genuinely identified**
-  (with a soft toe the fit wants linear range to hold the midtone slope; the
-  near-zero-latitude result was an artifact of the crushing toe). Balance is
-  identified but flattens above 0 (gain past 0 is ~0.5% of its range, railing
-  on a weak gradient) → ships at 0.
-- **Safe = (1.5, 9.0), latitude 10%.** Shadow slope at −7 EV: 1.19 — open.
-  **Hard/soft are derived, not hand-picked**: since the sigmoid powers are not
-  exposed in the GUI, the presets and the latitude slider together must tile
-  the range of transition strengths. "Soft" halves the peak perceptual shoulder
-  sharpness of safe → (1.1, 4.5); "hard" is the usable ceiling (~1.4× safe) →
-  (2.1, 12.7). Toe powers follow the shoulder's power ratios. Shadow slopes at
-  −7 EV: soft 1.42, safe 1.19, hard 0.92 — crushing is nobody's default. The
-  preset × latitude sweep tiles shoulder sharpness from ~11 to ~72 J/EV² with
-  consistent ordering at every latitude (verified 1–60%).
-- Consequently `spline_version` now **defaults to v4** for new edits (old edits
-  keep their stored params), with default latitude 10% and balance 0.
-- Composition order: the anchors are curve-relative, so
-  `derive_filmic_agx_primaries.py` (which imports this harness's curve model,
-  `CURVE_DEFAULTS` kept in sync with the C `$DEFAULT`s) was re-run against the
-  new defaults — see above for the resulting anchors.
+  the blacks were still "a bit crushed" after the first fix). Two structural
+  facts surfaced. First, the hardness power function alone darkens shadows
+  enormously (slope 4.0 at −6.5 EV for a *straight* spline): the toe's actual
+  job is to *fight the hardness*, not to add compression of its own. Second,
+  the model treats any shadow difference below the screen's stray-light floor
+  as invisible — so with office-grade flare (0.5%), crushing everything below
+  −4 EV was literally free, and the optimizer took the deal. The viewer
+  judging the result worked in better conditions than the model assumed. The
+  default fit now assumes demanding viewing (0.1% flare, dim room), and two
+  things fall out: the safe toe exponent converges to **1.5 — exactly the AgX
+  heritage value, recovered from first principles** — and the latitude rises
+  to **~10%, now genuinely pinned by the data** (with a soft toe the fit wants
+  some straight segment to hold the mid-tone slope; the earlier "latitude ~0"
+  answer was an artifact of the crushing toe).
+- **Final defaults: safe = (1.5, 9.0), latitude 10%, balance 0.** Shadow slope
+  at −7 EV: 1.19 — open, detail alive. **Hard and soft are derived, not
+  hand-picked**: since the sigmoid exponents are not exposed in the GUI, the
+  three presets and the latitude slider together must cover the useful range
+  of transition strengths between them. "Soft" is solved to produce *half* of
+  safe's peak perceptual shoulder sharpness → (1.1, 4.5); "hard" is the usable
+  ceiling at ~1.4× → (2.1, 12.7). Shadow slopes at −7 EV: soft 1.42, safe
+  1.19, hard 0.92 — so crushed blacks are now an explicit opt-in, nobody's
+  default. The preset × latitude grid was verified to stay well-ordered and
+  well-spaced at every latitude from 1 to 60%.
+- Consequently `spline_version` now **defaults to v4** for new edits (old
+  edits keep their stored parameters), with default latitude 10% and balance 0.
+- Order of operations for maintainers: the anchors are curve-relative, so
+  `derive_filmic_agx_primaries.py` (which imports this harness's curve model;
+  keep `CURVE_DEFAULTS` in sync with the C `$DEFAULT`s) was re-run against
+  these defaults — the anchors quoted earlier are the result.
 
 ## Follow-ups
 
