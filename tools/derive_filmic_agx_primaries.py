@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fit the inset/rotation anchor constants of filmic RGB's "AgX-like" color science
+Fit the inset/rotation anchor constants of filmic RGB's "AgX" color science
 (v8) — see doc/filmic-agx.md and filmic_agx_prepare_bracket() in
 src/iop/filmicrgb.c, whose PROVISIONAL constants this script is meant to replace.
 
@@ -136,6 +136,54 @@ def boundary_colors():
 
 SHOULDER_EV = BLACK_EV + CURVE.sh_x * (WHITE_EV - BLACK_EV)  # where compression starts
 
+# ---------------------------------------------------------------- priority colors
+# The colors whose fidelity is non-negotiable : human skin tones (database from
+# src/common/color_vocabulary.c, CIE Lab under D65, avg ± 1.5 std corners) and
+# in-gamut diffuse reflectances, both swept over the tonal placements a
+# photographer may give them. Used to fit the outset recovery (see --fit-outset).
+
+_SKIN_LAB = [  # L avg,std, a avg,std, b avg,std — see color_vocabulary.c for sources
+    (60.9, 3.4, 7.0, 1.7, 15.0, 1.8), (61.9, 3.7, 7.1, 1.7, 17.4, 2.0),
+    (60.6, 4.8, 6.5, 1.6, 16.4, 2.3), (63.0, 5.5, 5.6, 1.9, 14.0, 2.9),
+    (56.4, 3.2, 11.7, 2.1, 16.3, 1.4), (56.8, 4.1, 11.6, 2.2, 17.7, 1.8),
+    (56.1, 4.5, 11.3, 2.1, 16.4, 2.2), (59.2, 5.1, 11.6, 2.8, 15.1, 2.3),
+    (44.0, 2.0, 14.0, 1.0, 19.0, 1.0), (58.0, 1.0, 15.0, 1.0, 21.0, 1.0),
+    (58.9, 3.1, 11.4, 2.1, 14.2, 1.5), (60.7, 4.0, 10.5, 2.3, 17.2, 2.1),
+    (58.0, 4.4, 11.7, 2.3, 15.8, 2.1), (59.6, 5.5, 11.8, 3.1, 14.6, 2.6),
+    (48.0, 1.0, 15.0, 1.0, 20.0, 1.0), (63.0, 1.0, 16.0, 1.0, 21.0, 1.0)]
+
+_D65_WHITE = np.array([0.95047, 1.0, 1.08883])
+
+def _lab_d65_to_work(L, a, b):
+    fy = (L + 16.0) / 116.0
+    fx, fz = fy + a / 500.0, fy - b / 200.0
+    f = lambda t: t**3 if t**3 > 0.008856 else (t - 16.0 / 116.0) / 7.787
+    xyz_d65 = _D65_WHITE * np.array([f(fx), f(fy), f(fz)])
+    xyz_d50 = np.linalg.inv(XYZ_D50_to_D65_CAT16) @ xyz_d65
+    return np.linalg.inv(REC2020_TO_XYZ_D50) @ xyz_d50
+
+def priority_samples():
+    """skin corners + diffuse hue circle, each swept over tonal placements"""
+    y_row = REC2020_TO_XYZ_D50[1]
+    def place(rgb, evs):
+        lum = y_row @ rgb
+        return [rgb * (GREY * 2.0**e / lum) for e in evs]
+    out = []
+    for (L, Ls, a, As, b, Bs) in _SKIN_LAB:
+        for dL in (-1.5, 0.0, 1.5):
+            for da in (-1.5, 1.5):
+                for db in (-1.5, 1.5):
+                    rgb = _lab_d65_to_work(L + dL * Ls, a + da * As, b + db * Bs)
+                    if rgb.min() > 0:
+                        out += place(rgb, (-1.5, -0.75, 0.0, 0.75, 1.5))
+    for k in range(12):
+        h = 2 * np.pi * k / 12
+        base = np.array([np.cos(h), np.cos(h - 2 * np.pi / 3), np.cos(h + 2 * np.pi / 3)])
+        base = (base - base.min()) / (base.max() - base.min())
+        for p in (0.3, 0.5, 0.7):
+            out += place(p * base + (1 - p) * 0.5, (-2, -1, 0, 1, 2, 2.5))
+    return out
+
 def chroma_trajectory(sample, M, M_inv):
     """chroma ratio and hue drift vs exposure, through the bracketed curve"""
     c_in, h_in = chroma_hue(rgb_work_to_Yrg(sample))
@@ -196,6 +244,22 @@ def main():
                          "+1 EV and leaves conditioning headroom for the user ray t <= 2.")
     ap.add_argument("--fit-insets", action="store_true",
                     help="fit all 6 parameters anyway (diagnostic; expect railed insets)")
+    ap.add_argument("--fit-outset", action="store_true",
+                    help="fit the outset recovery factor kappa. The outset is the inverse of "
+                         "the bracket built with kappa-scaled insets (kappa = 1 : exact "
+                         "inverse). An exact inverse mandatorily bleaches every color the "
+                         "curve touches — with the low-latitude sigmoid default that is the "
+                         "whole tonal range, washing out valid midtone colors (skin tones). "
+                         "kappa > 1 over-expands so that priority colors (skin database + "
+                         "diffuse reflectances, over their tonal placements) reach the "
+                         "output-chroma-equals-input clamp : the clamp then trims recovery "
+                         "to exactly 1.0 per pixel, tone-adaptively, which is what makes one "
+                         "fixed kappa portable across curves and dynamic ranges (verified "
+                         "6.5-16 EV). Then re-fits the inset-blue and outset rotations for the "
+                         "RECOVERED-chroma regime (the kappa recovery re-exposes drift the "
+                         "bleaching used to hide), under the maintainer's priority ordering. "
+                         "This is the CURRENT production fit ; it supersedes --minimax, which "
+                         "was correct only for the earlier bleached (exact-inverse) regime.")
     ap.add_argument("--minimax", action="store_true",
                     help="fit rotations for the WORST-CASE hue drift (Chebyshev) over "
                          "EV <= +3.5 instead of zero-mean L2. This is the right objective "
@@ -203,11 +267,133 @@ def main():
                          "FILMIC_AGX_UNANCHORED_HUE_TEST in filmicrgb.c) : without a "
                          "backstop, only the worst case matters. Floor is ~28.5° — the "
                          "drift field reverses direction between toe and shoulder, which "
-                         "no constant matrix pair can serve on both sides.")
+                         "no constant matrix pair can serve on both sides. SUPERSEDED by "
+                         "--fit-outset : minimax was fit for the bleached exact-inverse regime "
+                         "and its blue rotation now CAUSES purple on recovered blues.")
     args = ap.parse_args()
 
     insets0 = np.full(3, args.inset)
     rot0 = np.zeros(3)
+    if args.fit_outset:
+        # production rotations (from --minimax) ; keep in sync with the C anchors
+        rot = np.array([-0.0436910, 0.1621254, 0.4199733])
+        M, _ = bracket_matrices(insets0, rot)
+        samples = priority_samples()
+
+        def p5_ratio(kappa, curve=CURVE, black=BLACK_EV, white=WHITE_EV):
+            Mk, _ = bracket_matrices(np.clip(kappa * insets0, 0.0, 0.9), rot)
+            M_out = np.linalg.inv(Mk)
+            ratios = []
+            for s in samples:
+                c_o, _ = chroma_hue(rgb_work_to_Yrg(s))
+                x = (np.log2(np.maximum(M @ s, 1e-10) / GREY) - black) / (white - black)
+                out = M_out @ np.array([curve(v) for v in x])
+                c_f, _ = chroma_hue(rgb_work_to_Yrg(np.maximum(out, 1e-10)))
+                ratios.append(c_f / max(c_o, 1e-9))
+            return np.percentile(ratios, 5)
+
+        lo, hi = 1.0, 2.5
+        for _ in range(20):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if p5_ratio(mid) < 1.0 else (lo, mid)
+        kappa = 0.5 * (lo + hi)
+        print(f"// OUTSET_RECOVERY (kappa) = {kappa:.3f} : smallest outset over-expansion")
+        print(f"// whose 5th-percentile pre-clamp chroma ratio on the priority set reaches 1")
+
+        # ---- rotations for the RECOVERED-CHROMA regime ----------------------
+        # kappa recovery keeps the drifting pixels saturated, so the drift is now
+        # visible where it used to be bleached invisible. Crucially, the old
+        # minimax blue inset rotation (+24 deg, tuned to counter BLEACHED-pixel
+        # drift) is measured to CAUSE most of the purple on RECOVERED saturated
+        # blues (isolation : +13.7 deg with it, +1.5 without, at ~95% chroma).
+        # So re-fit for the recovered regime. Structure that works (a free 6-param
+        # search wanders into skin-wrecking minima) : keep inset red/green at their
+        # diffuse-validated values (they protect skin, sunset and foliage — zeroing
+        # them sends green to -25 deg and sunsets to +37 deg), fit inset BLUE plus
+        # the three outset deltas. Priority weights, from the maintainer's stated
+        # ordering (skin/reflective = absolute priority ; blue LED purple = the
+        # worst real complaint ; sunset should drift yellow not red) :
+        from scipy.optimize import minimize
+        M_srgb = np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722],
+                           [0.0193, 0.1192, 0.9505]])
+        M_2020 = np.array([[0.6370, 0.1446, 0.1689], [0.2627, 0.6780, 0.0593],
+                           [0.0000, 0.0281, 1.0610]])
+        TO2020 = np.linalg.inv(M_2020) @ M_srgb
+        blue_srgb = np.maximum(TO2020 @ np.array([0.0, 0.0, 1.0]), 1e-6)
+        y_row = REC2020_TO_XYZ_D50[1]
+
+        def place(rgb, evs):
+            lum = y_row @ rgb
+            return [rgb * (GREY * 2.0**e / lum) for e in evs]
+        skin_set, sunset_set = [], []
+        for (L, Ls, a, As, b, Bs) in _SKIN_LAB:
+            for da in (-1.5, 1.5):
+                for db in (-1.5, 1.5):
+                    rgb = _lab_d65_to_work(L, a + da * As, b + db * Bs)
+                    if rgb.min() > 0:
+                        skin_set += place(rgb, (-1.5, 0.0, 1.5))
+        for base in ([1, .45, .12], [1, .6, .2]):
+            for pu in (.6, .9):
+                sunset_set += place(np.maximum(TO2020 @ (pu * np.array(base) + (1 - pu) * .5), 1e-6),
+                                    (0.0, 1.5, 3.0))
+
+        def run_px(rgb, M_in, M_out):
+            c_o, h_o = chroma_hue(rgb_work_to_Yrg(rgb))
+            x = (np.log2(np.maximum(M_in @ rgb, 1e-10) / GREY) - BLACK_EV) / (WHITE_EV - BLACK_EV)
+            out = M_out @ np.array([CURVE(v) for v in x])
+            c_f, h_f = chroma_hue(rgb_work_to_Yrg(np.maximum(out, 1e-10)))
+            dh = np.rad2deg(np.remainder(h_f - h_o + np.pi, 2 * np.pi) - np.pi)
+            return min(c_f, c_o) / max(c_o, 1e-9), dh, c_f / max(c_o, 1e-9)
+
+        # sign convention : drift > 0 is yellow-ward for warm hues (skin/sunset),
+        # drift < 0 is red-ward. Red-ward on skin/sunset is the maintainer's veto.
+        def objective(p):
+            irot = np.array([rot[0], rot[1], p[0]])       # inset red/green fixed, blue free
+            orot = irot + p[1:]                           # outset = inset + deltas
+            M_in, _ = bracket_matrices(insets0, irot)
+            Mk, _ = bracket_matrices(np.clip(kappa * insets0, 0.0, 0.9), orot)
+            M_out = np.linalg.inv(Mk)
+            blue = max(abs(run_px(blue_srgb * GREY * 2.0**ev, M_in, M_out)[1]) for ev in (3.5, 4.0, 4.5))
+            skd = [run_px(s, M_in, M_out)[1] for s in skin_set]
+            snd = [run_px(s, M_in, M_out)[1] for s in sunset_set]
+            p5 = np.percentile([run_px(s, M_in, M_out)[2] for s in samples[::4]], 5)
+            posmin = M_in.min()
+            return (blue                                        # #1 : blue purple
+                    + 30.0 * max(0.0, -min(skd) - 1.5)          # skin red-ward veto (cap 1.5)
+                    + 10.0 * max(0.0, max(skd) - 4.0)           # skin excess yellow
+                    + 10.0 * max(0.0, -min(snd) - 1.0)          # sunset must not go red
+                    + 100.0 * max(0.0, 0.9 - p5)                # diffuse recovery preserved
+                    + 1e4 * max(0.0, 0.005 - posmin))           # inset positivity margin
+
+        x0 = np.deg2rad([3.0, 0.4, 3.1, 4.5])
+        res = minimize(objective, x0, method="Nelder-Mead",
+                       options={"xatol": 2e-4, "fatol": 5e-3, "maxiter": 500})
+        irot = np.array([rot[0], rot[1], res.x[0]])
+        orot = irot + res.x[1:]
+        print("static const float rotation_anchor[3] = { %+.7ff, %+.7ff, %+.7ff }; // %+.2f°, %+.2f°, %+.2f°"
+              % (*irot, *np.rad2deg(irot)))
+        print("static const float outset_rotation[3] = { %+.7ff, %+.7ff, %+.7ff }; // %+.2f°, %+.2f°, %+.2f°"
+              % (*orot, *np.rad2deg(orot)))
+        M_in, _ = bracket_matrices(insets0, irot)
+        Mk, _ = bracket_matrices(np.clip(kappa * insets0, 0.0, 0.9), orot)
+        M_out = np.linalg.inv(Mk)
+        b4 = run_px(blue_srgb * GREY * 16.0, M_in, M_out)
+        skd = [run_px(s, M_in, M_out)[1] for s in skin_set]
+        snd = [run_px(s, M_in, M_out)[1] for s in sunset_set]
+        print("// sRGB blue @+4EV drift %+.1f deg (%.0f%% chroma) ; skin [%+.1f..%+.1f] ; sunset [%+.1f..%+.1f]"
+              % (b4[1], 100 * b4[0], min(skd), max(skd), min(snd), max(snd)))
+        print("// inset positivity min %.4f ; portability (post-clamp p5) :" % M_in.min())
+        for (bl, wh, name) in ((-4.0, 2.5, "studio 6.5EV"), (-8.0, 4.0, "default 12EV"), (-10.0, 6.0, "HDR 16EV")):
+            c = curve_factory(bl, wh, *CURVE_DEFAULTS)
+            ratios = []
+            for s in samples:
+                c_o, _ = chroma_hue(rgb_work_to_Yrg(s))
+                x = (np.log2(np.maximum(M_in @ s, 1e-10) / GREY) - bl) / (wh - bl)
+                out = M_out @ np.array([c(v) for v in x])
+                c_f, _ = chroma_hue(rgb_work_to_Yrg(np.maximum(out, 1e-10)))
+                ratios.append(min(c_f / max(c_o, 1e-9), 1.0))
+            print("//   %-13s p5 %.3f" % (name, np.percentile(ratios, 5)))
+        return
     if args.minimax:
         from scipy.optimize import minimize
         evs = np.arange(-6.0, 3.51, 0.5)  # visible range : beyond, the gamut mapper crushes chroma

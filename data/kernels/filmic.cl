@@ -53,7 +53,7 @@ typedef enum dt_iop_filmicrgb_colorscience_type_t
   DT_FILMIC_COLORSCIENCE_V3 = 2,
   DT_FILMIC_COLORSCIENCE_V4 = 3,
   DT_FILMIC_COLORSCIENCE_V5 = 4,
-  DT_FILMIC_COLORSCIENCE_V6 = 5, // AgX-like
+  DT_FILMIC_COLORSCIENCE_V6 = 5, // AgX
 } dt_iop_filmicrgb_colorscience_type_t;
 
 typedef enum dt_iop_filmicrgb_reconstruction_type_t
@@ -843,7 +843,7 @@ static inline float4 filmic_agx(const float4 i,
                                 constant const float *const inset_matrix, constant const float *const outset_matrix,
                                 const float4 luma_coeffs, const float beta, const float beta_hue)
 {
-  // AgX-like rendering : per-channel tone mapping in an inset rendering space.
+  // AgX rendering : per-channel tone mapping in an inset rendering space.
   // Mirrors filmic_agx() in filmicrgb.c — see doc/filmic-agx.md.
   float4 pix = i;
   pix.x = isnan(pix.x) ? 0.f : clamp(pix.x, -1e6f, 1e6f);

@@ -154,7 +154,7 @@ typedef enum dt_iop_filmicrgb_colorscience_type_t
   DT_FILMIC_COLORSCIENCE_V3 = 2, // $DESCRIPTION: "v5 (2021)"
   DT_FILMIC_COLORSCIENCE_V4 = 3, // $DESCRIPTION: "v6 (2022)"
   DT_FILMIC_COLORSCIENCE_V5 = 4, // $DESCRIPTION: "v7 (2023)"
-  DT_FILMIC_COLORSCIENCE_V6 = 5, // $DESCRIPTION: "v8 (AgX-like)"
+  DT_FILMIC_COLORSCIENCE_V6 = 5, // $DESCRIPTION: "v8 (AgX)"
 } dt_iop_filmicrgb_colorscience_type_t;
 
 typedef enum dt_iop_filmicrgb_spline_version_type_t
@@ -337,10 +337,10 @@ typedef struct dt_iop_filmicrgb_data_t
   int version;
   int spline_version;
   int high_quality_reconstruction;
-  float agx_beta;     // AgX-like: chroma fidelity mix [0, 1] (0 = bleached, 1 = original chroma)
-  float agx_beta_hue; // AgX-like: hue fidelity mix [0, 1] — saturates to 1 at the slider center,
-                      // so hue recovers fully before chroma does (see commit_params)
-  float agx_purity;   // AgX-like: inset strength multiplier t [1, 2] along the fitted anchor ray
+  float agx_beta;     // AgX: residual chroma recovery [0, 1] beyond the bracket's own
+                      // self-recovery, opt-in on the positive slider half (see commit_params)
+  float agx_beta_hue; // AgX: hue fidelity mix [0, 1] — 1 from the slider center upward,
+                      // the drift character fades in on the negative half only
   struct dt_iop_filmic_rgb_spline_t spline DT_ALIGNED_ARRAY;
   dt_noise_distribution_t noise_distribution;
 } dt_iop_filmicrgb_data_t;
@@ -2245,7 +2245,7 @@ static inline void filmic_v5(const float *const restrict in, float *const restri
 }
 
 
-/* AgX-like rendering : per-channel tone mapping in an inset rendering space.
+/* AgX rendering : per-channel tone mapping in an inset rendering space.
  *
  * The working-space primaries are compressed toward the white point ("inset") and
  * rotated in the Kirk/Filmlight Yrg chromaticity plane, the filmic curve is applied
@@ -2281,35 +2281,16 @@ static inline void _mat3_identity(dt_colormatrix_t M)
     for(size_t c = 0; c < 4; c++) M[r][c] = (r == c && r < 3) ? 1.f : 0.f;
 }
 
-static void filmic_agx_prepare_bracket(const dt_iop_order_iccprofile_info_t *const work_profile,
-                                       const float purity, dt_colormatrix_t inset, dt_colormatrix_t outset)
+/* Build M = work RGB -> displaced space : per-primary chroma compression toward
+ * the white point ("inset") and hue rotation, both in the Kirk/Filmlight Yrg
+ * chromaticity plane so one degree of rotation means the same perceptual hue
+ * shift for every primary. The columns of M are the displaced primaries in work
+ * RGB, white-point normalized (rows sum to 1 : a conservative channel mixer).
+ * Returns FALSE on degenerate primaries. */
+static gboolean _filmic_agx_build_displaced(const dt_iop_order_iccprofile_info_t *const work_profile,
+                                            const float inset[3], const float rotation[3],
+                                            dt_colormatrix_t M)
 {
-  // Anchor constants of the rendering space : per-primary chroma compression ("inset")
-  // and hue rotation, expressed in the Kirk/Filmlight Yrg chromaticity plane so one
-  // degree of rotation means the same perceptual hue shift for every primary.
-  // The purity param walks the ray t * anchors, t in [1, 2] : positivity and
-  // conditioning were verified over the whole ray by the fit harness.
-  // Values from tools/derive_filmic_agx_primaries.py (drift target 0 = neutral,
-  // hue-stable character — no warm bias baked in), fitted against the
-  // appearance-matched default curve (contrast 1.18, latitude 33%, safe powers
-  // 4.0/6.5) : insets are uniform at the knee of the bleach-depth curve (deeper
-  // insets saturate because the exact-inverse outset re-expands what the curve
-  // did not equalize, and the Yrg gamut mapper owns the very endpoint) ;
-  // rotations are least-squares fitted for zero-mean hue drift per EV of
-  // compression — blue sits at the +15° positivity-budget bound and counters the
-  // classic blue-toward-purple per-channel skew (worst-case drift 65° -> 48°).
-  static const float inset_anchor[3] = { 0.25f, 0.25f, 0.25f };
-  // minimax rotation refit (tools/derive_filmic_agx_primaries.py --minimax) against
-  // the appearance-matched default curve (contrast 1.18, latitude 10%, safe powers
-  // 1.5/9.0, 0.1% flare) : minimizes the WORST-CASE hue drift (23.8° floor over
-  // EV <= +3.5) instead of the mean. Minimax retained after the 2026-07
-  // unanchored-hue visual test : even with the parametric hue recovery restored on
-  // top, bounding the worst case is the better base behavior at the character end
-  // of the slider (beta -> 0). Ray positivity (t in [1, 2]) is enforced inside the
-  // fit residuals and is the active constraint on the blue rotation ; the minimax
-  // landscape is a plateau, so refits land on different but equivalent solutions.
-  static const float rotation_anchor[3] = { -0.0436910f, +0.1621254f, +0.4199733f }; // -2.50°, +9.29°, +24.06°
-
   // working-space primaries and white point in XYZ D50 : columns of the RGB->XYZ matrix
   dt_aligned_pixel_t white_xyz = { 0.f };
   dt_aligned_pixel_t white_Yrg = { 0.f };
@@ -2328,10 +2309,9 @@ static void filmic_agx_prepare_bracket(const dt_iop_order_iccprofile_info_t *con
     // compress chroma toward the white point and rotate hue, at constant luminance
     const float dr = primary_Yrg[1] - white_Yrg[1];
     const float dg = primary_Yrg[2] - white_Yrg[2];
-    const float scale = 1.f - CLAMPF(purity * inset_anchor[i], 0.f, 0.9f);
-    const float angle = purity * rotation_anchor[i];
-    const float cos_a = cosf(angle);
-    const float sin_a = sinf(angle);
+    const float scale = 1.f - CLAMPF(inset[i], 0.f, 0.9f);
+    const float cos_a = cosf(rotation[i]);
+    const float sin_a = sinf(rotation[i]);
     const dt_aligned_pixel_t displaced_Yrg = { primary_Yrg[0],
                                                white_Yrg[1] + scale * (cos_a * dr - sin_a * dg),
                                                white_Yrg[2] + scale * (sin_a * dr + cos_a * dg), 0.f };
@@ -2341,32 +2321,78 @@ static void filmic_agx_prepare_bracket(const dt_iop_order_iccprofile_info_t *con
   }
 
   // Rescale the displaced primaries so they share the working white point :
-  // solve P_prime · s = white_xyz then scale the columns by s. The bracket is then
-  // white-point preserving (rows of inset sum to 1) hence exactly transparent for
-  // achromatic pixels and, with the exact-inverse outset, for any pixel whose three
-  // channels sit in the latitude.
+  // solve P_prime · s = white_xyz then scale the columns by s. Gray stays gray.
   dt_colormatrix_t P_prime_inv = { { 0.f } };
-  if(mat3SSEinv(P_prime_inv, P_prime))
-  {
-    // degenerate displaced primaries : neutral bracket
-    _mat3_identity(inset);
-    _mat3_identity(outset);
-    return;
-  }
+  if(mat3SSEinv(P_prime_inv, P_prime)) return FALSE;
   dt_aligned_pixel_t s = { 0.f };
   dot_product(white_xyz, P_prime_inv, s);
   for(size_t r = 0; r < 3; r++)
     for(size_t c = 0; c < 3; c++) P_prime[r][c] *= s[c];
 
-  // inset = work XYZ->RGB × P_inset : its columns are the displaced primaries
-  // expressed in work RGB, i.e. a conservative (row-stochastic) channel mixer.
-  dt_colormatrix_mul(inset, work_profile->matrix_out, P_prime);
+  dt_colormatrix_mul(M, work_profile->matrix_out, P_prime);
+  return TRUE;
+}
 
-  // Exact inverse : residual desaturation/drift is then strictly a function of the
-  // curve non-linearity. Baked-in midtone purity changes (Blender's partial outset)
-  // are a grading decision that belongs to color balance RGB, not the view transform.
-  if(mat3SSEinv(outset, inset))
+static void filmic_agx_prepare_bracket(const dt_iop_order_iccprofile_info_t *const work_profile,
+                                       dt_colormatrix_t inset, dt_colormatrix_t outset)
+{
+  // All constants from tools/derive_filmic_agx_primaries.py, fitted against the
+  // appearance-matched default curve (contrast 1.18, latitude 10%, safe powers
+  // 1.5/9.0), drift target 0 : neutral, hue-stable character — no warm bias.
+  //
+  // Insets : uniform, chosen at the knee of bleach effectiveness on boundary /
+  // clipped colors (their actual job — measured irrelevant for legitimate bright
+  // colors, whose bleaching comes from the per-channel shoulder convergence).
+  static const float inset_anchor[3] = { 0.25f, 0.25f, 0.25f };
+  // Rotations : re-fitted (2026-07) for the RECOVERED-CHROMA regime. The old
+  // minimax fit drove the blue inset rotation to +24° (positivity-bound) to
+  // counter the blue->purple drift of BLEACHED pixels ; once the kappa recovery
+  // keeps those pixels saturated, that same rotation was measured to CAUSE most
+  // of the visible purple on saturated blues at +3.5..+4.5 EV (isolation probe :
+  // +13.7° with it, +1.5° without, at ~95% retained chroma). Blue is now +1°,
+  // fitted for the recovered regime : blue @+4 EV drift -0.3° (96%), green +0.5°,
+  // skin red-ward capped at -1.5° (asymmetric constraint : yellow-ward drift is
+  // acceptable on skin/sunsets, red-ward is not — visual testing), sunsets all
+  // yellow-ward. Red/green keep their production values, which protect the
+  // sunset/skin region (removing all rotations wrecks green to -25° and sunsets
+  // to +37°). Static matrices trade regions against each other — see
+  // doc/filmic-agx.md for the whack-a-mole analysis.
+  static const float rotation_anchor[3] = { -0.0436910f, +0.1621254f, +0.0189867f }; // -2.50°, +9.29°, +1.09°
+  // Outset : the inverse of the bracket built with KAPPA-scaled insets (same
+  // rotations, so they are exactly undone). An exact inverse (kappa = 1) would
+  // mandatorily bleach every color the curve touches — with the low-latitude
+  // sigmoid default that is the whole tonal range, washing out valid midtone
+  // colors (skin tones : a racial-bias issue, see doc/filmic-agx.md). kappa > 1
+  // over-expands so that priority colors (skin database + diffuse reflectances)
+  // REACH the output-chroma <= input-chroma clamp of the pixel path : the clamp
+  // then trims the recovery to exactly 1.0 per pixel, tone-adaptively, which is
+  // what makes one fixed kappa portable (post-clamp p5 >= 0.97, median = 1.000,
+  // verified over 6.5-16 EV curves by --fit-outset). Hue drift is insensitive
+  // to kappa (measured), so this stage is independent of the rotations fit.
+  // Bleaching survives where convergence dominates : specular/clipped colors
+  // (boundary endpoint ratio 0.59) and the gamut mapper near display white.
+  static const float kappa = 1.51f;
+  // Outset rotations : the inset rotations plus fitted deltas (--fit-outset).
+  // The kappa recovery re-exposes the per-channel hue drifts that bleaching used
+  // to hide, so the outset gets its own rotation set — and unlike the inset's,
+  // it is NOT bound by the log-positivity budget (it acts after the curve, where
+  // negatives are the gamut mapper's business). Fitted by chroma-weighted minimax
+  // over the sRGB gamut boundary (the priority region : legitimate diffuse and
+  // emissive content), with skin drift capped at 3° (active constraint) and the
+  // kappa recovery preserved (p5 >= 1). Peak visible skew (model, without the
+  // gamut mapper's near-white crush) : sRGB blue +17.6° -> +13.7° at +4 EV ;
+  // the residual is structural — drift is EV-dependent, static matrices cannot
+  // cancel a direction that changes along the tone axis.
+  static const float outset_rotation[3] = { -0.0355958f, +0.2275760f, +0.1084553f }; // -2.04°, +13.04°, +6.21°
+
+  const float inset_recovery[3] = { kappa * inset_anchor[0], kappa * inset_anchor[1],
+                                    kappa * inset_anchor[2] };
+  dt_colormatrix_t M_recovery = { { 0.f } };
+  if(!_filmic_agx_build_displaced(work_profile, inset_anchor, rotation_anchor, inset)
+     || !_filmic_agx_build_displaced(work_profile, inset_recovery, outset_rotation, M_recovery)
+     || mat3SSEinv(outset, M_recovery))
   {
+    // degenerate primaries : neutral bracket
     _mat3_identity(inset);
     _mat3_identity(outset);
   }
@@ -2428,7 +2454,7 @@ static inline void filmic_agx(const float *const restrict in, float *const restr
   // rendering-space bracket : work RGB -> inset rendering space -> work RGB
   dt_colormatrix_t inset = { { 0.f } };
   dt_colormatrix_t outset = { { 0.f } };
-  filmic_agx_prepare_bracket(work_profile, data->agx_purity, inset, outset);
+  filmic_agx_prepare_bracket(work_profile, inset, outset);
   dt_colormatrix_t inset_t, outset_t;
   transpose_3xSSE(inset, inset_t);
   transpose_3xSSE(outset, outset_t);
@@ -2707,7 +2733,7 @@ int process(dt_iop_module_t *self, const dt_dev_pixelpipe_t *pipe, const dt_dev_
 
   if(data->version == DT_FILMIC_COLORSCIENCE_V6)
   {
-    // AgX-like color science : per-channel curve in an inset rendering space with
+    // AgX color science : per-channel curve in an inset rendering space with
     // parametric Ych hue recovery. Ignores preserve_color, like v7.
     filmic_agx(in, out, work_profile, export_profile, data, data->spline, roi_out->width,
                roi_out->height, ch, black_display, white_display);
@@ -3022,7 +3048,7 @@ int process_cl(struct dt_iop_module_t *self, const dt_dev_pixelpipe_t *pipe, con
   cl_mem export_input_matrix_cl = NULL;
   cl_mem export_output_matrix_cl = NULL;
 
-  // AgX-like rendering-space bracket (v8 only)
+  // AgX rendering-space bracket (v8 only)
   cl_mem inset_matrix_cl = NULL;
   cl_mem outset_matrix_cl = NULL;
   float luma_coeffs[4] = { work_profile->matrix_in[1][0], work_profile->matrix_in[1][1],
@@ -3031,7 +3057,7 @@ int process_cl(struct dt_iop_module_t *self, const dt_dev_pixelpipe_t *pipe, con
   {
     dt_colormatrix_t inset = { { 0.f } };
     dt_colormatrix_t outset = { { 0.f } };
-    filmic_agx_prepare_bracket(work_profile, d->agx_purity, inset, outset);
+    filmic_agx_prepare_bracket(work_profile, inset, outset);
     float inset_3x4[12];
     float outset_3x4[12];
     pack_3xSSE_to_3x4(inset, inset_3x4);
@@ -3916,26 +3942,28 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   else
     d->saturation = (2.0f * p->saturation / 100.0f + 1.0f);
 
-  // AgX-like color science : the saturation slider becomes a bipolar character/fidelity axis
-  // with the same shape as the v7 slider (zero = equal mix of both strategies).
-  // beta mixes the color (chroma + hue in Ych) between the per-channel result (0, full
-  // bleach and drift) and the original (1, norm-like color at per-channel lightness) ;
-  // the negative half additionally scales the inset/rotation anchors up along their
-  // fitted ray for a stronger character. Bright legitimate colors (sunsets) wash through
-  // the per-channel shoulder convergence itself — measured to be independent of the
-  // bracket — so the recovery mix, not the anchors, is the fidelity control.
+  // AgX color science : the saturation slider is a bipolar character/fidelity axis.
+  // Chroma preservation of valid diffuse colors (skin tones, product colors) is NOT on
+  // this slider : it is built into the bracket itself (the outset over-expands by kappa
+  // so priority colors reach the output-chroma <= input-chroma clamp — mandatory
+  // bleaching of valid midtone colors is a racial-bias issue, see doc/filmic-agx.md).
+  //
+  // Slider a in [-1, +1] :
+  //   hue recovery  beta_hue    = (a + 1) / 2   : 0 at -100%, 0.5 at 0%, 1 at +100%
+  //   chroma recov. beta_chroma = max(0, a)     : 0 at <= 0%, ramps to 1 at +100%
+  // So : -100% = pure AgX (no recovery of any kind, full per-channel character) ;
+  //       0%   = half the hue drift removed, chroma entirely as the bracket delivers
+  //              (diffuse recovered, extreme highlights bleached) ;
+  //     +100%  = original hue AND original chroma restored — AgX contributes only the
+  //              per-channel luminance (colorimetric, ratio-preserving color).
+  // The purple-band failure mode (restored chroma landing on a drifted hue) stays
+  // closed : chroma recovery is zero until 0%, and on the positive half the residual
+  // hue drift (1 - beta_hue) shrinks to 0 by +100%, so restored chroma never meets a
+  // fully-drifted hue. Diffuse colors are immune regardless (bracket already recovers
+  // their chroma, so the beta_chroma mix has equal endpoints).
   const float agx_axis = CLAMPF(p->saturation / 100.0f, -1.f, 1.f);
-  d->agx_beta = 0.5f * (agx_axis + 1.f);
-  // Hue recovers FULLY by the slider center while chroma is only half-restored.
-  // The visible error is hue-drift x chroma, and the two are anti-correlated
-  // along the slider (character end : full drift but bleached ; fidelity end :
-  // full chroma but no drift), so any blend coupling them peaks mid-slider —
-  // seen as a purple band on blue gradients at the default position (visual
-  // testing, 2026-07). Decoupled, the right half of the slider is drift-free by
-  // construction and the drift character fades in only on the left half,
-  // together with the stronger bleaching it belongs to.
-  d->agx_beta_hue = CLAMPF(agx_axis + 1.f, 0.f, 1.f);
-  d->agx_purity = 1.f + fmaxf(0.f, -agx_axis);
+  d->agx_beta = fmaxf(0.f, agx_axis);
+  d->agx_beta_hue = 0.5f * (agx_axis + 1.f);
 
   d->sigma_toe = powf(d->spline.latitude_min / 3.0f, 2.0f);
   d->sigma_shoulder = powf((1.0f - d->spline.latitude_max) / 3.0f, 2.0f);
@@ -5461,7 +5489,7 @@ void gui_init(dt_iop_module_t *self)
   gtk_box_pack_start(GTK_BOX(self->widget), label, FALSE, FALSE, 0);
 
   g->saturation = dt_bauhaus_slider_from_params(self, "saturation");
-  dt_bauhaus_slider_set_soft_range(g->saturation, -50.0, 50.0);
+  dt_bauhaus_slider_set_soft_range(g->saturation, -100.0, 100.0);
   dt_bauhaus_slider_set_format(g->saturation, "%");
   gtk_widget_set_tooltip_text(g->saturation, _("desaturates the output of the module\n"
                                                "specifically at extreme luminances.\n"
@@ -5588,13 +5616,14 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
     {
       dt_bauhaus_widget_set_label(g->saturation, N_("color preservation"));
       gtk_widget_set_tooltip_text(g->saturation, _("balance between chromatic character and color fidelity.\n"
-                                                   "negative values fade in the per-channel hue drifts and\n"
-                                                   "increase the bleaching (stronger 'film' character).\n"
-                                                   "positive values restore the original chroma\n"
-                                                   "(ratio-preserving color at per-channel lightness),\n"
-                                                   "keeping bright legitimate colors like sunsets saturated.\n"
-                                                   "from zero upward, hues are already fully preserved;\n"
-                                                   "zero restores half of the original chroma."));
+                                                   "valid diffuse colors (skin tones, product colors) keep\n"
+                                                   "their saturation at any setting: this is built-in.\n"
+                                                   "-100%% is pure AgX: full per-channel hue drift and\n"
+                                                   "bleaching of strongly compressed colors (the 'film' look).\n"
+                                                   "0%% (default) removes half the hue drift; chroma is left\n"
+                                                   "as the transform delivers (diffuse kept, highlights bleached).\n"
+                                                   "+100%% restores the original hue and chroma completely,\n"
+                                                   "the transform then only maps brightness."));
       gtk_widget_set_visible(GTK_WIDGET(g->preserve_color), FALSE);
     }
     else if(p->version == DT_FILMIC_COLORSCIENCE_V1 || p->version == DT_FILMIC_COLORSCIENCE_V4)
