@@ -1386,7 +1386,8 @@ static gboolean _thumbtable_dnd_import(GtkSelectionData *selection_data)
                                   .discarded = NULL
                                   };
 
-      dt_control_import(data);
+      if(dt_control_import(data))
+        dt_control_log(_("Could not start the import job."));
     }
     else fprintf(stderr,"No files to import. Check your selection or use 'File > Import'.");
   }

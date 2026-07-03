@@ -74,6 +74,7 @@ FILE(GLOB SOURCE_FILES
   "common/exif.cc"
   "common/film.c"
   "common/file_location.c"
+  "common/folder_survey.c"
   "common/focus_peaking.c"
   "common/fp_mode.c"
   "common/gaussian.c"
