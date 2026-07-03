@@ -337,10 +337,10 @@ typedef struct dt_iop_filmicrgb_data_t
   int version;
   int spline_version;
   int high_quality_reconstruction;
-  float agx_beta;     // AgX: residual chroma recovery [0, 1] beyond the bracket's own
-                      // self-recovery, opt-in on the positive slider half (see commit_params)
-  float agx_beta_hue; // AgX: hue fidelity mix [0, 1] — 1 from the slider center upward,
-                      // the drift character fades in on the negative half only
+  float agx_beta_hue; // AgX: hue recovery mix [0, 1] — 0 at -100% (full AgX drift),
+                      // 1 at +100% (original hue). Chroma is NOT user-controlled : it
+                      // follows the bracket's own kappa recovery + clamp only, because
+                      // mixing any original chroma back kinks highlight gradients.
   struct dt_iop_filmic_rgb_spline_t spline DT_ALIGNED_ARRAY;
   dt_noise_distribution_t noise_distribution;
 } dt_iop_filmicrgb_data_t;
@@ -2467,7 +2467,6 @@ static inline void filmic_agx(const float *const restrict in, float *const restr
 
   const dt_aligned_pixel_simd_t luma_coeffs = { work_profile->matrix_in[1][0], work_profile->matrix_in[1][1],
                                                 work_profile->matrix_in[1][2], 0.f };
-  const float beta = data->agx_beta;
   const float beta_hue = data->agx_beta_hue;
 
   __OMP_PARALLEL_FOR__()
@@ -2491,25 +2490,20 @@ static inline void filmic_agx(const float *const restrict in, float *const restr
     // bleaching is allowed, spontaneous chroma boosts are not
     const float chroma_final = fminf(Ych_original[1], Ych_final[1]);
 
-    // Parametric color recovery : Ych chroma is luminance-normalized, so restoring
-    // the original chromaticity at the tone-mapped Y is saturation-invariant, i.e.
-    // norm-like (ratio-preserving) color. beta therefore spans a continuum from
-    // full per-channel character (bleach + skew, beta = 0) to norm-like color
-    // fidelity (beta = 1) while the *luminance* stays per-channel — which avoids
-    // the flattened lightness gradients of actual norm-based tone mapping.
-    // Overshoot near display white is clipped by the gamut mapping below, so max
-    // display emission remains reachable.
+    // Chroma is bracket-driven ONLY : chroma_final is the outset's kappa recovery
+    // (valid diffuse colors reach the clamp = original chroma) then bleached where
+    // the curve converges. The user slider does NOT recover chroma — mixing any
+    // original chroma back in kinks highlight gradients (the recovered value fights
+    // the bracket's smooth bleach roll-off at the min() clamp), so it was removed.
     //
-    // The hue mix MUST blend the chromaticity VECTORS (chroma-weighted), not the
-    // hue angles : heavily bleached or clipped pixels leave the curve with
-    // near-zero chroma and a meaningless hue (exactly achromatic ones get the
-    // red-axis placeholder from pipe_RGB_to_Ych), and a unit-vector hue mix
-    // weights that garbage as much as the real original hue — mid-slider, a
-    // bright blue gradient swung through magenta this way. Weighted by chroma,
-    // an achromatic result contributes no direction at all.
-    // The hue and chroma use SEPARATE weights (beta_hue saturates to 1 at the
-    // slider center) : restored chroma must never arrive on a drifted hue, or
-    // the drift x chroma product peaks mid-slider as a purple band.
+    // The slider recovers HUE only. The mix MUST blend the chromaticity VECTORS
+    // (chroma-weighted), not the hue angles : heavily bleached or clipped pixels
+    // leave the curve with near-zero chroma and a meaningless hue (exactly
+    // achromatic ones get the red-axis placeholder from pipe_RGB_to_Ych), and a
+    // unit-vector hue mix weights that garbage as much as the real original hue —
+    // mid-slider, a bright blue gradient swung through magenta this way. Weighted
+    // by chroma, an achromatic result contributes no direction at all.
+    // beta_hue : 0 at -100% (keep the AgX drift), 1 at +100% (original hue).
     const float r_mix = beta_hue * Ych_original[1] * Ych_original[2]
                         + (1.f - beta_hue) * chroma_final * Ych_final[2];
     const float g_mix = beta_hue * Ych_original[1] * Ych_original[3]
@@ -2518,7 +2512,7 @@ static inline void filmic_agx(const float *const restrict in, float *const restr
     dt_aligned_pixel_simd_t Ych_reference = Ych_original;
     Ych_reference[2] = (norm_mix > 1e-9f) ? r_mix / norm_mix : Ych_original[2];
     Ych_reference[3] = (norm_mix > 1e-9f) ? g_mix / norm_mix : Ych_original[3];
-    Ych_final[1] = beta * Ych_original[1] + (1.f - beta) * chroma_final;
+    Ych_final[1] = chroma_final;
 
     dt_store_simd_nontemporal(out + k,
                               gamut_mapping_simd(Ych_final, Ych_reference, output_matrix,
@@ -3292,8 +3286,7 @@ int process_cl(struct dt_iop_module_t *self, const dt_dev_pixelpipe_t *pipe, con
     dt_opencl_set_kernel_arg(devid, gd->kernel_filmic_rgb_chroma, 36, sizeof(cl_mem), (void *)&inset_matrix_cl);
     dt_opencl_set_kernel_arg(devid, gd->kernel_filmic_rgb_chroma, 37, sizeof(cl_mem), (void *)&outset_matrix_cl);
     dt_opencl_set_kernel_arg(devid, gd->kernel_filmic_rgb_chroma, 38, 4 * sizeof(float), (void *)&luma_coeffs);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_filmic_rgb_chroma, 39, sizeof(float), (void *)&d->agx_beta);
-    dt_opencl_set_kernel_arg(devid, gd->kernel_filmic_rgb_chroma, 40, sizeof(float), (void *)&d->agx_beta_hue);
+    dt_opencl_set_kernel_arg(devid, gd->kernel_filmic_rgb_chroma, 39, sizeof(float), (void *)&d->agx_beta_hue);
 
     err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_filmic_rgb_chroma, sizes);
     if(err != CL_SUCCESS) goto error;
@@ -3943,26 +3936,19 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     d->saturation = (2.0f * p->saturation / 100.0f + 1.0f);
 
   // AgX color science : the saturation slider is a bipolar character/fidelity axis.
-  // Chroma preservation of valid diffuse colors (skin tones, product colors) is NOT on
-  // this slider : it is built into the bracket itself (the outset over-expands by kappa
-  // so priority colors reach the output-chroma <= input-chroma clamp — mandatory
-  // bleaching of valid midtone colors is a racial-bias issue, see doc/filmic-agx.md).
+  // The slider recovers HUE ONLY. Chroma is never user-controlled : it is entirely
+  // the bracket's own kappa recovery + clamp (valid diffuse colors — skin tones,
+  // product colors — reach the output <= input chroma clamp, so they keep their
+  // saturation ; strongly compressed colors bleach smoothly). Mixing any original
+  // chroma back on top of that kinks highlight gradients where the recovered value
+  // meets the bracket's roll-off, so the chroma-recovery term (former d->agx_beta)
+  // was removed (2026-07). Bleaching valid midtone colors is a racial-bias issue,
+  // handled by the bracket, not by this slider — see doc/filmic-agx.md.
   //
-  // Slider a in [-1, +1] :
-  //   hue recovery  beta_hue    = (a + 1) / 2   : 0 at -100%, 0.5 at 0%, 1 at +100%
-  //   chroma recov. beta_chroma = max(0, a)     : 0 at <= 0%, ramps to 1 at +100%
-  // So : -100% = pure AgX (no recovery of any kind, full per-channel character) ;
-  //       0%   = half the hue drift removed, chroma entirely as the bracket delivers
-  //              (diffuse recovered, extreme highlights bleached) ;
-  //     +100%  = original hue AND original chroma restored — AgX contributes only the
-  //              per-channel luminance (colorimetric, ratio-preserving color).
-  // The purple-band failure mode (restored chroma landing on a drifted hue) stays
-  // closed : chroma recovery is zero until 0%, and on the positive half the residual
-  // hue drift (1 - beta_hue) shrinks to 0 by +100%, so restored chroma never meets a
-  // fully-drifted hue. Diffuse colors are immune regardless (bracket already recovers
-  // their chroma, so the beta_chroma mix has equal endpoints).
+  // Slider a in [-1, +1] : beta_hue = (a + 1) / 2 : 0 at -100% (full AgX drift, the
+  // film character), 0.5 at 0% (half the drift removed), 1 at +100% (original hue
+  // restored, chroma still bracket-bleached).
   const float agx_axis = CLAMPF(p->saturation / 100.0f, -1.f, 1.f);
-  d->agx_beta = fmaxf(0.f, agx_axis);
   d->agx_beta_hue = 0.5f * (agx_axis + 1.f);
 
   d->sigma_toe = powf(d->spline.latitude_min / 3.0f, 2.0f);
@@ -5615,15 +5601,13 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
     if(p->version == DT_FILMIC_COLORSCIENCE_V6)
     {
       dt_bauhaus_widget_set_label(g->saturation, N_("color preservation"));
-      gtk_widget_set_tooltip_text(g->saturation, _("balance between chromatic character and color fidelity.\n"
-                                                   "valid diffuse colors (skin tones, product colors) keep\n"
-                                                   "their saturation at any setting: this is built-in.\n"
-                                                   "-100%% is pure AgX: full per-channel hue drift and\n"
-                                                   "bleaching of strongly compressed colors (the 'film' look).\n"
-                                                   "0%% (default) removes half the hue drift; chroma is left\n"
-                                                   "as the transform delivers (diffuse kept, highlights bleached).\n"
-                                                   "+100%% restores the original hue and chroma completely,\n"
-                                                   "the transform then only maps brightness."));
+      gtk_widget_set_tooltip_text(g->saturation, _("how much of the per-channel hue drift to keep.\n"
+                                                   "saturation is not affected: valid diffuse colors\n"
+                                                   "(skin tones, product colors) keep their saturation and\n"
+                                                   "strongly compressed colors bleach, at any setting.\n"
+                                                   "-100%% is pure AgX: full hue drift (the 'film' look).\n"
+                                                   "0%% (default) removes half the hue drift.\n"
+                                                   "+100%% restores the original hues exactly."));
       gtk_widget_set_visible(GTK_WIDGET(g->preserve_color), FALSE);
     }
     else if(p->version == DT_FILMIC_COLORSCIENCE_V1 || p->version == DT_FILMIC_COLORSCIENCE_V4)

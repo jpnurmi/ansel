@@ -432,45 +432,40 @@ flattened local contrast; its left end gives you the full film character. Any
 overshoot near display white is caught by the gamut mapper, so peak display
 brightness stays reachable.
 
-The slider value `s ∈ [−100, +100]` (hard limits ±200, clamped to ±100 for the
-recovery) maps to two independent weights, `a = s/100`:
+The slider is **hue-only**: it recovers none,
+some or all of the per-channel hue drift and never touches chroma. With
+`a = s/100 ∈ [−1, +1]`:
 
-- `β_hue = (a + 1) / 2` — how much of the original hue is restored. A single
-  linear ramp across the whole slider: **0 at −100%, 0.5 at the center, 1 at
-  +100%**. The per-channel hue drift is thus a continuously dialable amount of
-  character rather than a half-of-the-slider region.
-- `β_chroma = max(0, a)` — *residual* chroma recovery, positive half only: it
-  restores the original chroma of the strongly-compressed colors (speculars,
-  clipped lights) that the bracket still bleaches — the product/jewelry case.
+- `β_hue = (a + 1) / 2` — a single linear ramp across the whole slider:
+  **0 at −100%, 0.5 at the center, 1 at +100%**;
+- **chroma is not user-controlled.** It is entirely the bracket's own
+  κ-recovery + clamp: valid diffuse colors reach the clamp (original chroma,
+  kept), strongly-compressed colors bleach along the bracket's smooth roll-off.
 
-There is deliberately **no chroma term at or below the center**: the chroma
-fidelity of valid diffuse colors is built into the bracket itself (see the
-third finding below), not opt-in on a slider. There is also no strength
-multiplier anymore: the earlier `t` mechanism (anchors scaled up to 2× on the
-left half) was removed with the self-recovery redesign — it doubled the
-worst-case hue drift (43.5° at t = 2 vs 29.7° at the anchors) for no benefit
-once bleaching stopped being the point of the left half.
+The three anchor points:
+- `s = −100` → **pure AgX**: full per-channel hue drift (the film character),
+  strongly-compressed colors bleached;
+- `s = 0` (default) → **half the hue drift removed**, chroma unchanged;
+- `s = +100` → **original hues restored exactly**, chroma still
+  bracket-bleached (the transform contributes the per-channel luminance and the
+  bleach roll-off, but no hue shift).
 
-So the three anchor points are:
-- `s = −100` → **pure AgX**: no recovery at all, full per-channel hue drift and
-  bleaching of the strongly-compressed range (the film character);
-- `s = 0` (default) → **half the hue drift removed**, chroma exactly as the
-  transform delivers (diffuse recovered by the bracket, extreme highlights
-  bleached);
-- `s = +100` → **fully colorimetric**: original hue and chroma both restored,
-  so the transform contributes only the per-channel luminance
-  (ratio-preserving color, "AgX provides only brightness").
+A short-lived earlier version also offered *chroma* recovery on the positive
+half (`β_chroma = max(0, a)`, for speculars/jewelry). It was removed: mixing
+any original chroma back on top of the bracket's output kinks highlight
+gradients — the recovered value `β·c_orig` fights the bracket's smooth bleach
+roll-off at the `min(c_orig, bracket)` clamp, and the visible seam in a bright
+colored gradient was worse than the muted highlight it rescued. Chroma fidelity
+of *valid* colors never needed the slider (it is in the bracket); recovering
+the chroma of *strongly-compressed* colors is better left to a downstream
+grading module, where it does not fight the tone map. (Also gone, from an even
+earlier design: the `t` strength multiplier that scaled the anchors up on the
+left half — it doubled the worst-case hue drift for no benefit once bleaching
+stopped being the point of that half.)
 
-Note the earlier design saturated `β_hue` to 1 at the center to keep restored
-chroma off a drifted hue. That protection is now structural instead: chroma
-recovery is zero until the center, so at and below it the half-recovered hue
-carries no restored chroma; on the positive half the residual drift
-`(1 − β_hue)` falls to 0 by +100% exactly as chroma rises, and diffuse colors
-are immune throughout (the bracket already recovered their chroma, so the
-`β_chroma` mix has equal endpoints). The product of "residual drift × recovered
-chroma" peaks only mildly (~⅛ of maximum, at +50%) and only for
-strongly-compressed colors — which is exactly the range the user is choosing to
-re-saturate there.
+The purple-band failure mode (restored chroma landing on a drifted hue) is now
+closed *by construction*: there is no restored chroma at all, so a
+partially-recovered hue can never carry extra saturation onto a wrong angle.
 
 **The mix must be chroma-weighted** (bug found in visual testing, 2026-07: a
 blue gradient swept from −10 to +15 EV turned magenta at the default slider
@@ -501,13 +496,11 @@ drift is zero. Their product therefore peaks mid-slider. Measured on a true
 sRGB blue: the per-channel skew reaches +29.6° toward violet around +4…+6 EV
 while 34–84% of the chroma survives, and the coupled mix at the center left a
 +8…+11° violet cast on 0.27–0.37 chroma — a visible purple band. The fix
-splits the two weights so they are never both partial-and-rising on a drifting
-color. (The later remap — §"The single runtime axis" — keeps this
-guarantee with a different split: chroma recovery is held at 0 through the
-center, so wherever the hue is only partially recovered on the negative and
-central range there is no restored chroma to miscolour; on the positive half
-the two rise together but the residual drift reaches 0 at +100%.) Diffuse
-colors are immune throughout.
+split the two weights so they were never both partial-and-rising on a drifting
+color. (This whole class of bug was later made moot — §"The single runtime
+axis" — when chroma recovery was removed from the slider entirely: with no
+restored chroma at all, a partially-recovered hue can never carry extra
+saturation onto a wrong angle.) Diffuse colors are immune throughout regardless.
 
 **And the bracket must self-recover diffuse chroma** (third finding, 2026-07:
 at −100% *everything* washed out, midtones included — olive skin tones bleached
@@ -729,13 +722,14 @@ Each of these requires bumping `DT_MODULE_INTROSPECTION` (new params members),
 which breaks the back-and-forth database compatibility contract — hence the
 bar is "users demonstrate a real limitation", not "would be nice".
 
-1. **Independent hue character and residual chroma recovery** (2 floats). The
-   bipolar slider makes the two opt-ins mutually exclusive: full hue drift
-   (left half) cannot be combined with specular chroma recovery (right half) —
-   e.g. concert photography may want the drift character *and* LED colors
-   held. This is the most likely first request. Until then, the coupling is
-   defensible: the two halves are one perceptual character↔fidelity axis, and
-   diffuse-color fidelity needs neither (built into the bracket).
+1. **Chroma recovery of strongly-compressed colors** (1 float). Removed from
+   the slider (it kinked highlight gradients, see the slider section), so
+   there is currently no way to un-bleach a specular or a clipped colored
+   light *inside* filmic — e.g. jewelry work where a highlight's colored glint
+   must hold. The intended answer is a downstream grading module (color balance
+   / saturation), where re-saturating does not fight the tone map's roll-off;
+   only add a param here if that workflow proves inadequate. Valid diffuse
+   colors need nothing (their chroma is in the bracket).
 2. **Continuous toe/shoulder powers** (2 floats). If the 3-step hard/soft/safe
    quantization of the sigmoid spline proves too coarse. Blender itself ships
    fixed powers, and the powers sit in "advanced" territory upstream, so demand

@@ -841,7 +841,7 @@ static inline float4 filmic_agx(const float4 i,
                                 constant const float *const export_matrix_in, constant const float *const export_matrix_out,
                                 const float y_max,
                                 constant const float *const inset_matrix, constant const float *const outset_matrix,
-                                const float4 luma_coeffs, const float beta, const float beta_hue)
+                                const float4 luma_coeffs, const float beta_hue)
 {
   // AgX rendering : per-channel tone mapping in an inset rendering space.
   // Mirrors filmic_agx() in filmicrgb.c — see doc/filmic-agx.md.
@@ -871,10 +871,10 @@ static inline float4 filmic_agx(const float4 i,
   // bleaching is allowed, spontaneous chroma boosts are not
   const float chroma_final = fmin(Ych_original.y, Ych_final.y);
 
-  // Parametric color recovery : the hue mix blends chromaticity VECTORS
-  // (chroma-weighted) so meaningless bleached hues carry no weight, and hue uses
-  // a SEPARATE weight (beta_hue, saturates to 1 at the slider center) so restored
-  // chroma never arrives on a drifted hue. Mirrors filmic_agx() in filmicrgb.c.
+  // HUE recovery only (chroma is bracket-driven : chroma_final, no user term).
+  // The hue mix blends chromaticity VECTORS (chroma-weighted) so meaningless
+  // bleached hues carry no weight. beta_hue : 0 at -100% (AgX drift), 1 at +100%
+  // (original hue). Mirrors filmic_agx() in filmicrgb.c.
   const float r_mix = beta_hue * Ych_original.y * Ych_original.z
                       + (1.f - beta_hue) * chroma_final * Ych_final.z;
   const float g_mix = beta_hue * Ych_original.y * Ych_original.w
@@ -883,7 +883,7 @@ static inline float4 filmic_agx(const float4 i,
   float4 Ych_reference = Ych_original;
   Ych_reference.z = (norm_mix > 1e-9f) ? r_mix / norm_mix : Ych_original.z;
   Ych_reference.w = (norm_mix > 1e-9f) ? g_mix / norm_mix : Ych_original.w;
-  Ych_final.y = beta * Ych_original.y + (1.f - beta) * chroma_final;
+  Ych_final.y = chroma_final;
 
   return gamut_mapping(Ych_final, Ych_reference, matrix_in, matrix_out,
                        export_matrix_in, export_matrix_out,
@@ -1155,7 +1155,7 @@ filmicrgb_chroma (read_only image2d_t in, write_only image2d_t out,
                  const float norm_min, const float norm_max,
                  const float y_min, const float y_max,
                  constant const float *const inset_matrix, constant const float *const outset_matrix,
-                 const float4 luma_coeffs, const float agx_beta, const float agx_beta_hue)
+                 const float4 luma_coeffs, const float agx_beta_hue)
 {
   const unsigned int x = get_global_id(0);
   const unsigned int y = get_global_id(1);
@@ -1215,7 +1215,7 @@ filmicrgb_chroma (read_only image2d_t in, write_only image2d_t out,
                      M1, M2, M3, M4, M5, latitude_min, latitude_max, output_power,
                      type, matrix_in, matrix_out, display_black, display_white,
                      use_output_profile, export_matrix_in, export_matrix_out,
-                     y_max, inset_matrix, outset_matrix, luma_coeffs, agx_beta, agx_beta_hue);
+                     y_max, inset_matrix, outset_matrix, luma_coeffs, agx_beta_hue);
       break;
     }
   }
