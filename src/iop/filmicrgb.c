@@ -154,7 +154,8 @@ typedef enum dt_iop_filmicrgb_colorscience_type_t
   DT_FILMIC_COLORSCIENCE_V5 = 4, // $DESCRIPTION: "v7 (2023)"
   DT_FILMIC_COLORSCIENCE_V6 = 5, // $DESCRIPTION: "v8 (AgX, no bleach)"
   DT_FILMIC_COLORSCIENCE_V7 = 6, // $DESCRIPTION: "v8 (AgX, low bleach)"
-  DT_FILMIC_COLORSCIENCE_V8 = 7, // $DESCRIPTION: "v8 (AgX, high bleach)"
+  DT_FILMIC_COLORSCIENCE_V8 = 7, // $DESCRIPTION: "v8 (AgX, medium bleach)"
+  DT_FILMIC_COLORSCIENCE_V9 = 8, // $DESCRIPTION: "v8 (AgX, high bleach)"
 } dt_iop_filmicrgb_colorscience_type_t;
 
 // The three v8 "AgX" variants share the whole pixel path and differ ONLY by the
@@ -165,7 +166,7 @@ typedef enum dt_iop_filmicrgb_colorscience_type_t
 static inline gboolean _filmic_is_agx(const dt_iop_filmicrgb_colorscience_type_t v)
 {
   return v == DT_FILMIC_COLORSCIENCE_V6 || v == DT_FILMIC_COLORSCIENCE_V7
-      || v == DT_FILMIC_COLORSCIENCE_V8;
+      || v == DT_FILMIC_COLORSCIENCE_V8 || v == DT_FILMIC_COLORSCIENCE_V9;
 }
 
 typedef enum dt_iop_filmicrgb_spline_version_type_t
@@ -2384,7 +2385,15 @@ static void filmic_agx_prepare_bracket(const dt_iop_order_iccprofile_info_t *con
       outset_anchor[0]   = 0.479379f; outset_anchor[1] = 0.746078f; outset_anchor[2] = 0.369679f;
       outset_rotation[0] = -0.0050757f; outset_rotation[1] = +0.1018535f; outset_rotation[2] = +0.0119466f;
       break;
-    case DT_FILMIC_COLORSCIENCE_V8: // high bleach : --max-desat 0.05
+    case DT_FILMIC_COLORSCIENCE_V8: // medium bleach : --fit-medium-bleach
+      // Same as above, splits the gap between low-bleach and high-bleach.
+      // avg desat (reflective) 10.6%, skin |mean| hue 1.4°, cond 5.0, Rec2020 gamut-safe.
+      inset_anchor[0]    = inset_anchor[1] = inset_anchor[2] = 0.595334f;
+      rotation_anchor[0] = -0.0273940f; rotation_anchor[1] = 0.0323704f; rotation_anchor[2] = 0.0236516f;
+      outset_anchor[0]   =  0.576994f; outset_anchor[1] = 0.768241f; outset_anchor[2] = 0.402336f;
+      outset_rotation[0] = -0.0167965f; outset_rotation[1] = 0.0642740f; outset_rotation[2] = 0.0419658f;
+      break;
+    case DT_FILMIC_COLORSCIENCE_V9: // high bleach : --max-desat 0.05
       // Best in-bracket hue. avg desat 5.0%, skin |mean| 0.8°, reflective max 6.3°,
       // cond 6.5. Saturated colors visibly wash out (the strong AgX highlight look).
       inset_anchor[0]    = inset_anchor[1] = inset_anchor[2] = 0.747987f;

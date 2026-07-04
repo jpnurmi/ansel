@@ -247,6 +247,9 @@ SHIPPED_VARIANTS = {  # inset is uniform ; outset is per-primary (over-expanding
     "low-bleach":  dict(fit="--fit-low-bleach", inset=0.487623,
                         irot=[-0.0176159, +0.0650293, +0.0044292],
                         outset=[0.479379, 0.746078, 0.369679], orot=[-0.0050757, +0.1018535, +0.0119466]),
+    "medium-bleach": dict(fit="--fit-medium-bleach", inset=0.595334,
+                          irot=[-0.0273940, +0.0323704, +0.0236516],
+                          outset=[0.576994, 0.768241, 0.402336], orot=[-0.0167965, +0.0642740, +0.0419658]),
     "high-bleach": dict(fit="--max-desat 0.05", inset=0.747987,
                         irot=[-0.0515563, -0.0375649, +0.0222773],
                         outset=[0.724651, 0.828507, 0.550322], orot=[-0.0438769, -0.0095878, +0.0521530]),
@@ -325,9 +328,96 @@ def rec2020_worst_boundary_luminance(M, Mo):
             worst = min(worst, float(y_row @ (Mo @ cv)))
     return worst
 
+def fit_midpoint(lo_key, hi_key, inset_lo, inset_hi, seed_insets):
+    """Solve for the bracket that best reproduces the AVERAGE of two variants' processed
+    outputs — the perceptual midpoint. Target = 0.5*(post_bracket(lo) + post_bracket(hi))
+    over a skin + reflective + Rec2020-boundary sample set (skin weighted x2), fit in
+    least squares under Rec2020 gamut safety, positivity and conditioning. Returns the
+    10-parameter bracket (uniform inset, inset rot[3], outset[3], outset rot[3]) or None."""
+    from scipy.optimize import minimize
+    y_row = REC2020_TO_XYZ_D50[1]
+
+    def post_bracket(S, M, Mo):
+        x = (np.log2(np.maximum(S @ M.T, 1e-10) / GREY) - BLACK_EV) / (WHITE_EV - BLACK_EV)
+        y = np.interp(np.clip(x, 0.0, 1.0).ravel(), _LUT_X, _LUT_Y).reshape(x.shape)
+        return y @ Mo.T
+
+    def brkp(p):
+        M, _ = bracket_matrices(np.full(3, p[0]), p[1:4])
+        Mo, _ = bracket_matrices(p[4:7], p[7:10])
+        return M, np.linalg.inv(Mo)
+
+    S_sk, S_rf = skin_and_reflective_sets()
+
+    def place(rgb, evs):
+        lum = y_row @ rgb
+        return [rgb * (GREY * 2.0 ** e / lum) for e in evs]
+    bnd = []
+    for c in ([1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 1, 1], [1, 0, 1], [1, 1, 0]):
+        bnd += place(np.maximum(np.array(c, float), 1e-6), (-4, -2, 0, 2))
+    S = np.vstack([S_sk, S_rf, np.array(bnd)])
+    wt = np.ones(len(S)); wt[:len(S_sk)] = 2.0           # weight skin (portraits)
+
+    def input_chroma(RGB):                               # module chroma_hue_batch is shadowed inside main()
+        LMS = ((RGB @ REC2020_TO_XYZ_D50.T) @ XYZ_D50_to_D65_CAT16.T) @ XYZ_D65_to_LMS_2006.T
+        a = LMS.sum(axis=1, keepdims=True)
+        rg = (LMS / np.where(a == 0.0, 1.0, a)) @ LMS_to_filmlightRGB.T
+        return np.hypot(rg[:, 0] - WHITE_YRG[1], rg[:, 1] - WHITE_YRG[2])
+    keep = input_chroma(S) > 0.03
+    S, wt = S[keep], wt[keep]
+
+    Mlo, Molo = variant_bracket(SHIPPED_VARIANTS[lo_key])
+    Mhi, Mohi = variant_bracket(SHIPPED_VARIANTS[hi_key])
+    TARGET = 0.5 * (post_bracket(S, Mlo, Molo) + post_bracket(S, Mhi, Mohi))
+
+    BIG = 1e6
+
+    def objective(p):
+        if not (inset_lo <= p[0] <= inset_hi):
+            return BIG
+        if p[4:7].min() < 0.02 or p[4:7].max() > 0.98:
+            return BIG
+        if np.abs(np.concatenate([p[1:4], p[7:10]])).max() > np.deg2rad(25):
+            return BIG
+        M, Mo = brkp(p)
+        if M.min() < 0.004 or max(np.linalg.cond(M), np.linalg.cond(Mo)) > 6.5:
+            return BIG
+        if rec2020_worst_boundary_luminance(M, Mo) <= 0.0:   # gamut safety : no black
+            return BIG
+        O = post_bracket(S, M, Mo)
+        return float(np.mean(wt[:, None] * (O - TARGET) ** 2))
+
+    best = None
+    for i0 in seed_insets:
+        x0 = [i0, -0.03, 0.16, 0.01, min(0.9, i0), min(0.9, i0 * 1.25), min(0.9, i0 * 0.9), -0.02, 0.17, 0.0]
+        r = minimize(objective, x0, method="Nelder-Mead",
+                     options={"xatol": 1e-6, "fatol": 1e-9, "maxiter": 9000, "maxfev": 9000})
+        if r.fun < BIG and (best is None or r.fun < best.fun):
+            best = r
+    return best.x if best is not None else None
+
+def print_midpoint_constants(p, mode, endpoints):
+    """Print the C constant block for a fitted midpoint bracket (or a failure note)."""
+    if p is None:
+        print("// no feasible %s under the constraints." % mode)
+        return
+    M, _ = bracket_matrices(np.full(3, p[0]), p[1:4])
+    Mo, _ = bracket_matrices(p[4:7], p[7:10])
+    Mo = np.linalg.inv(Mo)
+    print("// fitted by tools/derive_filmic_agx_primaries.py %s" % mode)
+    print("// perceptual midpoint of %s (average of processed outputs)" % endpoints)
+    print("// Rec2020 gamut safety : worst boundary luminance %+.4f ; cond %.1f"
+          % (rec2020_worst_boundary_luminance(M, Mo), max(np.linalg.cond(M), np.linalg.cond(Mo))))
+    print("static const float inset_anchor[3]    = { %.6ff, %.6ff, %.6ff };" % (p[0], p[0], p[0]))
+    print("static const float rotation_anchor[3] = { %+.7ff, %+.7ff, %+.7ff }; // %+.2f°, %+.2f°, %+.2f°"
+          % (p[1], p[2], p[3], *np.rad2deg(p[1:4])))
+    print("static const float outset_anchor[3]   = { %.6ff, %.6ff, %.6ff };" % (p[4], p[5], p[6]))
+    print("static const float outset_rotation[3] = { %+.7ff, %+.7ff, %+.7ff }; // %+.2f°, %+.2f°, %+.2f°"
+          % (p[7], p[8], p[9], *np.rad2deg(p[7:10])))
+
 def report_variants():
     """Print the {avg,max} x {desaturation,hue drift} x {skin,reflective} table for
-    the three shipped variants, plus a Rec2020 gamut-safety check. Desaturation is over
+    the four shipped variants, plus a Rec2020 gamut-safety check. Desaturation is over
     all colors that carry chroma ; hue drift is measured where chroma survives (ratio >
     0.2 — a bleached color has no meaningful hue). This is the source of the tables in
     doc/filmic-agx.md and the user docs."""
@@ -473,6 +563,9 @@ def main():
                          "Rec2020 gamut safety, skin red-ward veto, positivity, conditioning "
                          "<= 6.5. Reads no/high-bleach from SHIPPED_VARIANTS ; refit if either "
                          "endpoint changes.")
+    ap.add_argument("--fit-medium-bleach", action="store_true",
+                    help="Fit the MEDIUM-BLEACH variant as the PERCEPTUAL MIDPOINT of low-bleach and "
+                         "high-bleach. See --fit-low-bleach")
     ap.add_argument("--report", action="store_true",
                     help="Measure the three SHIPPED variants (no/low/high bleach) and print the "
                          "{avg ; max} desaturation and hue-shift table for skin tones vs "
@@ -483,82 +576,19 @@ def main():
     args = ap.parse_args()
 
     if args.fit_low_bleach:
-        from scipy.optimize import minimize
-        y_row = REC2020_TO_XYZ_D50[1]
-
-        def post_bracket(S, M, Mo):                          # post-bracket display RGB (N,3)
-            x = (np.log2(np.maximum(S @ M.T, 1e-10) / GREY) - BLACK_EV) / (WHITE_EV - BLACK_EV)
-            y = np.interp(np.clip(x, 0.0, 1.0).ravel(), _LUT_X, _LUT_Y).reshape(x.shape)
-            return y @ Mo.T
-
-        def brkp(p):
-            M, _ = bracket_matrices(np.full(3, p[0]), p[1:4])
-            Mo, _ = bracket_matrices(p[4:7], p[7:10])
-            return M, np.linalg.inv(Mo)
-
-        # sample set : skin + reflective + Rec2020 boundary primaries/secondaries, over EVs
-        S_sk, S_rf = skin_and_reflective_sets()
-
-        def place(rgb, evs):
-            lum = y_row @ rgb
-            return [rgb * (GREY * 2.0 ** e / lum) for e in evs]
-        bnd = []
-        for c in ([1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 1, 1], [1, 0, 1], [1, 1, 0]):
-            bnd += place(np.maximum(np.array(c, float), 1e-6), (-4, -2, 0, 2))
-        S = np.vstack([S_sk, S_rf, np.array(bnd)])
-        wt = np.ones(len(S)); wt[:len(S_sk)] = 2.0           # weight skin (portraits)
-
-        def input_chroma(RGB):                               # module chroma_hue_batch is shadowed inside main()
-            LMS = ((RGB @ REC2020_TO_XYZ_D50.T) @ XYZ_D50_to_D65_CAT16.T) @ XYZ_D65_to_LMS_2006.T
-            a = LMS.sum(axis=1, keepdims=True)
-            rg = (LMS / np.where(a == 0.0, 1.0, a)) @ LMS_to_filmlightRGB.T
-            return np.hypot(rg[:, 0] - WHITE_YRG[1], rg[:, 1] - WHITE_YRG[2])
-        keep = input_chroma(S) > 0.03
-        S, wt = S[keep], wt[keep]
-
-        Mn, Mon = variant_bracket(SHIPPED_VARIANTS["no-bleach"])
-        Mh, Moh = variant_bracket(SHIPPED_VARIANTS["high-bleach"])
-        TARGET = 0.5 * (post_bracket(S, Mn, Mon) + post_bracket(S, Mh, Moh))  # the average
-
-        BIG = 1e6
-
-        def objective(p):
-            if not (0.20 <= p[0] <= 0.75):
-                return BIG
-            if p[4:7].min() < 0.02 or p[4:7].max() > 0.98:
-                return BIG
-            if np.abs(np.concatenate([p[1:4], p[7:10]])).max() > np.deg2rad(25):
-                return BIG
-            M, Mo = brkp(p)
-            if M.min() < 0.004 or max(np.linalg.cond(M), np.linalg.cond(Mo)) > 6.5:
-                return BIG
-            if rec2020_worst_boundary_luminance(M, Mo) <= 0.0:   # gamut safety : no black
-                return BIG
-            O = post_bracket(S, M, Mo)
-            return float(np.mean(wt[:, None] * (O - TARGET) ** 2))
-
-        best = None
-        for i0 in (0.35, 0.45, 0.55):
-            x0 = [i0, -0.03, 0.16, 0.01, min(0.9, i0), min(0.9, i0 * 1.25), min(0.9, i0 * 0.9), -0.02, 0.17, 0.0]
-            r = minimize(objective, x0, method="Nelder-Mead",
-                         options={"xatol": 1e-6, "fatol": 1e-9, "maxiter": 9000, "maxfev": 9000})
-            if r.fun < BIG and (best is None or r.fun < best.fun):
-                best = r
-        if best is None:
+        p = fit_midpoint("no-bleach", "high-bleach", 0.20, 0.75, (0.35, 0.45, 0.55))
+        if p is not None:
+            print_midpoint_constants(p, "--fit-low-bleach", "no-bleach and high-bleach")
+        else:
             print("// no feasible low-bleach midpoint under the constraints.")
-            return
-        p = best.x
-        M, Mo = brkp(p)
-        print("// fitted by tools/derive_filmic_agx_primaries.py --fit-low-bleach")
-        print("// perceptual midpoint of no-bleach and high-bleach (average of processed outputs)")
-        print("// Rec2020 gamut safety : worst boundary luminance %+.4f ; cond %.1f"
-              % (rec2020_worst_boundary_luminance(M, Mo), max(np.linalg.cond(M), np.linalg.cond(Mo))))
-        print("static const float inset_anchor[3]    = { %.6ff, %.6ff, %.6ff };" % (p[0], p[0], p[0]))
-        print("static const float rotation_anchor[3] = { %+.7ff, %+.7ff, %+.7ff }; // %+.2f°, %+.2f°, %+.2f°"
-              % (p[1], p[2], p[3], *np.rad2deg(p[1:4])))
-        print("static const float outset_anchor[3]   = { %.6ff, %.6ff, %.6ff };" % (p[4], p[5], p[6]))
-        print("static const float outset_rotation[3] = { %+.7ff, %+.7ff, %+.7ff }; // %+.2f°, %+.2f°, %+.2f°"
-              % (p[7], p[8], p[9], *np.rad2deg(p[7:10])))
+        return
+    
+    if args.fit_medium_bleach:
+        p = fit_midpoint("low-bleach", "high-bleach", 0.20, 0.75, (0.35, 0.45, 0.55))
+        if p is not None:
+            print_midpoint_constants(p, "--fit-medium-bleach", "low-bleach and high-bleach")
+        else:
+            print("// no feasible medium-bleach midpoint under the constraints.")
         return
 
     if args.report:

@@ -632,8 +632,9 @@ hue circle, each swept over tonal placements. Desaturation is chroma loss
 
 | variant | skin desat avg/max | skin hue drift avg/max | reflective desat avg/max | reflective hue drift avg/max |
 |---|---|---|---|---|
-| **no bleach** (default) | **0.0% / 0.0%** | 2.9° / 9.0° | 3.7% / 63.4% | 3.5° / 19.7° |
+| **no bleach** | **0.0% / 0.0%** | 2.9° / 9.0° | 3.7% / 63.4% | 3.5° / 19.7° |
 | **low bleach** | 0.0% / 0.0% | 2.0° / 6.3° | 7.1% / 71.4% | 2.6° / 12.9° |
+| **medium bleach** | 0.4% / 9.2% | 1.4° / 4.4° | 10.6% / 75.1% | 2.1° / 10.0° |
 | **high bleach** | 2.6% / 19.0% | **0.8° / 2.1°** | 15.4% / 78.4% | 1.6° / 6.3° |
 
 The single axis is visible across every column: from no→high bleach, hue drift
