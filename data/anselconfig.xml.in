@@ -842,6 +842,13 @@
     <longdescription>delete each source image only after the destination has been imported and its complete byte stream matches the original</longdescription>
   </dtconfig>
   <dtconfig>
+    <name>studio_capture/on_conflict</name>
+    <type min="0" max="2">int</type>
+    <default>2</default>
+    <shortdescription>behaviour on destination name conflict for surveyed imports</shortdescription>
+    <longdescription>0 = skip (keep the existing destination), 1 = overwrite, 2 = create a unique filename</longdescription>
+  </dtconfig>
+  <dtconfig>
     <name>studio_capture/datetime</name>
     <type>string</type>
     <default/>

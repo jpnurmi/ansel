@@ -51,8 +51,7 @@ typedef struct dt_control_import_t
   dt_import_onconflict_t on_conflict;
 
   // Optional list of style names (owned char*) applied, in order, to each
-  // successfully imported image. The first style is applied in REPLACE mode
-  // (wiping the freshly-imported default history), the rest in APPEND mode.
+  // successfully imported image. All styles are applied in APPEND mode.
   GList *styles;
 
   // String expanded as $(JOBCODE) in patterns

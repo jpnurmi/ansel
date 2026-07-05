@@ -13,13 +13,15 @@
     GNU General Public License for more details.
 */
 
-/** Studio Capture: import module. Two tabs hold the folder survey settings:
-    "Source" (monitored folder) and "Destination" (copy mode, naming patterns,
-    conflict policy...). The scan frequency and the session Start/Stop button
-    sit below the tabs. Every widget persists its conf key immediately; the
-    survey engine reads conf on each scan, so destination changes take effect
-    on the next pass, while the source folder and the scan frequency are
-    locked during a session to protect the engine's baseline. */
+/** Studio Capture: import module. The scan frequency and session status sit
+    at the top, above two tabs holding the folder survey settings: "Source"
+    (monitored folder) and "Destination" (copy mode, naming patterns,
+    conflict policy...); the Start/Stop button is the notebook's action
+    widget, on the tab row itself, to the right of the tab labels. Every
+    widget persists its conf key immediately; the survey engine reads conf on
+    each scan, so destination changes take effect on the next pass, while the
+    source folder and the scan frequency are locked during a session to
+    protect the engine's baseline. */
 
 #include "common/darktable.h"
 #include "common/datetime.h"
@@ -53,7 +55,7 @@ typedef struct dt_lib_studio_import_t
   GtkWidget *file_pattern;
   GtkWidget *preview;
 
-  // Session controls, below the tabs
+  // Session controls: interval/status at the top, toggle as the notebook's action widget
   GtkWidget *interval;
   GtkWidget *status;
   GtkWidget *toggle;
@@ -99,15 +101,28 @@ static void _studio_import_update_state(dt_lib_studio_import_t *d)
 
   if(active)
   {
+    gtk_widget_set_sensitive(d->toggle, TRUE);
     char *folder = dt_conf_get_string("studio_capture/folder");
-    gchar *status = g_strdup_printf(_("Monitoring `%s`"), folder ? folder : "");
+    gchar *status = g_strdup_printf(_("Status: Monitoring `%s`"), folder ? folder : "");
     gtk_label_set_text(GTK_LABEL(d->status), status);
     dt_free(status);
     dt_free(folder);
+    return;
   }
+
+  // Not running: gray out Start until the configuration has the minimum it
+  // needs to succeed, and say why (in orange) in the status label.
+  const char *message = NULL;
+  const gboolean ready = dt_folder_survey_can_start(&message);
+  gtk_widget_set_sensitive(d->toggle, ready);
+  if(ready)
+    gtk_label_set_text(GTK_LABEL(d->status), _("Ready to start the session."));
   else
-    gtk_label_set_text(GTK_LABEL(d->status),
-                       _("Select the folder receiving the captured images, then start the session."));
+  {
+    gchar *markup = g_markup_printf_escaped("<span foreground='orange'>%s</span>", message);
+    gtk_label_set_markup(GTK_LABEL(d->status), markup);
+    dt_free(markup);
+  }
 }
 
 static void _studio_import_update_preview(dt_lib_studio_import_t *d)
@@ -146,6 +161,7 @@ static void _studio_import_source_folder_callback(GtkWidget *widget, gpointer us
     dt_conf_set_string("studio_capture/folder", folder);
     dt_free(folder);
   }
+  _studio_import_update_state((dt_lib_studio_import_t *)user_data);
 }
 
 static void _studio_import_interval_callback(GtkWidget *widget, gpointer user_data)
@@ -175,6 +191,7 @@ static void _studio_import_copy_callback(GtkWidget *widget, gpointer user_data)
 {
   dt_conf_set_bool("studio_capture/copy", gtk_combo_box_get_active(GTK_COMBO_BOX(widget)) == 1);
   _studio_import_update_preview((dt_lib_studio_import_t *)user_data);
+  _studio_import_update_state((dt_lib_studio_import_t *)user_data);
 }
 
 static void _studio_import_delete_callback(GtkWidget *widget, gpointer user_data)
@@ -192,12 +209,14 @@ static void _studio_import_datetime_callback(GtkWidget *widget, gpointer user_da
 {
   dt_conf_set_string("studio_capture/datetime", gtk_entry_get_text(GTK_ENTRY(widget)));
   _studio_import_update_preview((dt_lib_studio_import_t *)user_data);
+  _studio_import_update_state((dt_lib_studio_import_t *)user_data);
 }
 
 static void _studio_import_jobcode_callback(GtkWidget *widget, gpointer user_data)
 {
   dt_conf_set_string("studio_capture/jobcode", gtk_entry_get_text(GTK_ENTRY(widget)));
   _studio_import_update_preview((dt_lib_studio_import_t *)user_data);
+  _studio_import_update_state((dt_lib_studio_import_t *)user_data);
 }
 
 static void _studio_import_base_folder_callback(GtkWidget *widget, gpointer user_data)
@@ -209,18 +228,21 @@ static void _studio_import_base_folder_callback(GtkWidget *widget, gpointer user
     dt_free(folder);
   }
   _studio_import_update_preview((dt_lib_studio_import_t *)user_data);
+  _studio_import_update_state((dt_lib_studio_import_t *)user_data);
 }
 
 static void _studio_import_subfolder_callback(GtkWidget *widget, gpointer user_data)
 {
   dt_conf_set_string("studio_capture/sub_directory_pattern", gtk_entry_get_text(GTK_ENTRY(widget)));
   _studio_import_update_preview((dt_lib_studio_import_t *)user_data);
+  _studio_import_update_state((dt_lib_studio_import_t *)user_data);
 }
 
 static void _studio_import_file_pattern_callback(GtkWidget *widget, gpointer user_data)
 {
   dt_conf_set_string("studio_capture/filename_pattern", gtk_entry_get_text(GTK_ENTRY(widget)));
   _studio_import_update_preview((dt_lib_studio_import_t *)user_data);
+  _studio_import_update_state((dt_lib_studio_import_t *)user_data);
 }
 
 /**
@@ -243,6 +265,36 @@ void gui_init(dt_lib_module_t *self)
 
   self->widget = gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_GUI_BOX_SPACING);
 
+  /* Session controls: scan frequency + status, at the top of the module */
+  
+  d->datetime = gtk_entry_new();
+  gtk_entry_set_text(GTK_ENTRY(d->datetime), dt_conf_get_string_const("studio_capture/datetime"));
+  gtk_entry_set_placeholder_text(GTK_ENTRY(d->datetime), _("Current date at scan time"));
+  g_signal_connect(G_OBJECT(d->datetime), "changed", G_CALLBACK(_studio_import_datetime_callback), d);
+  _studio_import_pack_row(GTK_BOX(self->widget), _("Project date"), d->datetime);
+
+  d->jobcode = gtk_entry_new();
+  gtk_entry_set_text(GTK_ENTRY(d->jobcode), dt_conf_get_string_const("studio_capture/jobcode"));
+  g_signal_connect(G_OBJECT(d->jobcode), "changed", G_CALLBACK(_studio_import_jobcode_callback), d);
+  _studio_import_pack_row(GTK_BOX(self->widget), _("Jobcode"), d->jobcode);
+  
+  d->interval = gtk_spin_button_new_with_range(2, 3600, 1);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(d->interval),
+                            CLAMP(dt_conf_get_int("studio_capture/interval"), 2, 3600));
+  gtk_widget_set_tooltip_text(d->interval, _("Applied the next time the session is started"));
+  g_signal_connect(G_OBJECT(d->interval), "value-changed", G_CALLBACK(_studio_import_interval_callback), d);
+  _studio_import_pack_row(GTK_BOX(self->widget), _("Scan frequency (seconds)"), d->interval);
+
+  d->status = gtk_label_new("");
+  gtk_widget_set_halign(d->status, GTK_ALIGN_START);
+  gtk_label_set_line_wrap(GTK_LABEL(d->status), TRUE);
+  gtk_label_set_ellipsize(GTK_LABEL(d->status), PANGO_ELLIPSIZE_MIDDLE);
+  gtk_box_pack_start(GTK_BOX(self->widget), d->status, FALSE, FALSE, 0);
+
+
+
+
+
   GtkNotebook *notebook = dt_ui_notebook_new();
   GtkWidget *source_page
       = dt_ui_notebook_page(notebook, _("Source"), _("Folder monitored during the session"));
@@ -250,16 +302,34 @@ void gui_init(dt_lib_module_t *self)
       = dt_ui_notebook_page(notebook, _("Destination"), _("Where and how the captured images are imported"));
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(notebook), FALSE, FALSE, 0);
 
+  /* Start/Stop sits on the tab row itself, to the right of the tab labels. */
+  d->toggle = gtk_toggle_button_new_with_label(_("Start the session"));
+  gtk_widget_set_tooltip_text(d->toggle,
+                              _("Monitor the source folder and import new images as they appear.\n"
+                                "The first scan records the existing images as a baseline: only images "
+                                "arriving afterwards are imported."));
+  g_signal_connect(G_OBJECT(d->toggle), "toggled", G_CALLBACK(_studio_import_toggle_callback), d);
+  gtk_notebook_set_action_widget(notebook, d->toggle, GTK_PACK_END);
+  gtk_widget_show(d->toggle);
+
   /* Source tab */
   d->source_folder
       = gtk_file_chooser_button_new(_("Select a folder to survey"), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER);
   const char *folder = dt_conf_get_string_const("studio_capture/folder");
   if(!IS_NULL_PTR(folder) && folder[0])
-    gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(d->source_folder), folder);
+    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(d->source_folder), folder);
   gtk_widget_set_tooltip_text(d->source_folder, _("Folder receiving the captured images to monitor"));
   g_signal_connect(G_OBJECT(d->source_folder), "file-set",
                    G_CALLBACK(_studio_import_source_folder_callback), d);
   _studio_import_pack_row(GTK_BOX(source_page), _("Folder to survey"), d->source_folder);
+
+  d->delete_source = gtk_check_button_new_with_label(_("Delete original file"));
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->delete_source),
+                               dt_conf_get_bool("studio_capture/delete_source"));
+  gtk_widget_set_tooltip_text(d->delete_source,
+                              _("Delete the original image file after verifying the complete copy."));
+  g_signal_connect(G_OBJECT(d->delete_source), "toggled", G_CALLBACK(_studio_import_delete_callback), d);
+  gtk_box_pack_start(GTK_BOX(source_page), d->delete_source, FALSE, FALSE, 0);
 
   /* Destination tab */
   d->copy = gtk_combo_box_text_new();
@@ -272,14 +342,6 @@ void gui_init(dt_lib_module_t *self)
   d->copy_options = gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_GUI_BOX_SPACING);
   gtk_widget_set_no_show_all(d->copy_options, TRUE);
   gtk_box_pack_start(GTK_BOX(destination_page), d->copy_options, FALSE, FALSE, 0);
-
-  d->delete_source = gtk_check_button_new_with_label(_("Delete original file"));
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->delete_source),
-                               dt_conf_get_bool("studio_capture/delete_source"));
-  gtk_widget_set_tooltip_text(d->delete_source,
-                              _("Delete the original image file after verifying the complete copy."));
-  g_signal_connect(G_OBJECT(d->delete_source), "toggled", G_CALLBACK(_studio_import_delete_callback), d);
-  gtk_box_pack_start(GTK_BOX(d->copy_options), d->delete_source, FALSE, FALSE, 0);
 
   d->on_conflict = gtk_combo_box_text_new();
   // Order matches dt_import_onconflict_t
@@ -295,22 +357,11 @@ void gui_init(dt_lib_module_t *self)
   g_signal_connect(G_OBJECT(d->on_conflict), "changed", G_CALLBACK(_studio_import_conflict_callback), d);
   _studio_import_pack_row(GTK_BOX(d->copy_options), _("On conflict"), d->on_conflict);
 
-  d->datetime = gtk_entry_new();
-  gtk_entry_set_text(GTK_ENTRY(d->datetime), dt_conf_get_string_const("studio_capture/datetime"));
-  gtk_entry_set_placeholder_text(GTK_ENTRY(d->datetime), _("Current date at scan time"));
-  g_signal_connect(G_OBJECT(d->datetime), "changed", G_CALLBACK(_studio_import_datetime_callback), d);
-  _studio_import_pack_row(GTK_BOX(d->copy_options), _("Project date"), d->datetime);
-
-  d->jobcode = gtk_entry_new();
-  gtk_entry_set_text(GTK_ENTRY(d->jobcode), dt_conf_get_string_const("studio_capture/jobcode"));
-  g_signal_connect(G_OBJECT(d->jobcode), "changed", G_CALLBACK(_studio_import_jobcode_callback), d);
-  _studio_import_pack_row(GTK_BOX(d->copy_options), _("Jobcode"), d->jobcode);
-
   d->base_folder
       = gtk_file_chooser_button_new(_("Select a base directory"), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER);
   const char *base_folder = dt_conf_get_string_const("studio_capture/base_directory_pattern");
   if(!IS_NULL_PTR(base_folder) && base_folder[0])
-    gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(d->base_folder), base_folder);
+    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(d->base_folder), base_folder);
   g_signal_connect(G_OBJECT(d->base_folder), "file-set", G_CALLBACK(_studio_import_base_folder_callback), d);
   _studio_import_pack_row(GTK_BOX(d->copy_options), _("Base directory"), d->base_folder);
 
@@ -339,28 +390,6 @@ void gui_init(dt_lib_module_t *self)
   gtk_label_set_ellipsize(GTK_LABEL(d->preview), PANGO_ELLIPSIZE_MIDDLE);
   gtk_label_set_line_wrap(GTK_LABEL(d->preview), TRUE);
   gtk_box_pack_start(GTK_BOX(destination_page), d->preview, FALSE, FALSE, 0);
-
-  /* Session controls, below the tabs */
-  d->interval = gtk_spin_button_new_with_range(2, 3600, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(d->interval),
-                            CLAMP(dt_conf_get_int("studio_capture/interval"), 2, 3600));
-  gtk_widget_set_tooltip_text(d->interval, _("Applied the next time the session is started"));
-  g_signal_connect(G_OBJECT(d->interval), "value-changed", G_CALLBACK(_studio_import_interval_callback), d);
-  _studio_import_pack_row(GTK_BOX(self->widget), _("Scan frequency (seconds)"), d->interval);
-
-  d->status = gtk_label_new("");
-  gtk_widget_set_halign(d->status, GTK_ALIGN_START);
-  gtk_label_set_line_wrap(GTK_LABEL(d->status), TRUE);
-  gtk_label_set_ellipsize(GTK_LABEL(d->status), PANGO_ELLIPSIZE_MIDDLE);
-  gtk_box_pack_start(GTK_BOX(self->widget), d->status, FALSE, FALSE, 0);
-
-  d->toggle = gtk_toggle_button_new_with_label(_("Start the session"));
-  gtk_widget_set_tooltip_text(d->toggle,
-                              _("Monitor the source folder and import new images as they appear.\n"
-                                "The first scan records the existing images as a baseline: only images "
-                                "arriving afterwards are imported."));
-  g_signal_connect(G_OBJECT(d->toggle), "toggled", G_CALLBACK(_studio_import_toggle_callback), d);
-  gtk_box_pack_start(GTK_BOX(self->widget), d->toggle, FALSE, FALSE, 0);
 
   _studio_import_update_preview(d);
   _studio_import_update_state(d);

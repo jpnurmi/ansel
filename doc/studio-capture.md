@@ -112,23 +112,37 @@ mask manager popup (`libs/masks.c`) stay `DT_VIEW_DARKROOM` only, unextracted.
 
 ## Import module
 
-Two tabs plus the session controls:
+Session controls at the top, then two tabs:
 
+- At the top: the scan frequency and the session status label. The source
+  folder and the scan frequency are locked while the session runs, since
+  changing the monitored folder behind the engine's back would invalidate its
+  baseline.
 - *Source* tab: the folder chooser of the monitored folder.
 - *Destination* tab: file handling (add vs copy) and, only when copying,
   delete-after-verify, **on conflict** policy (skip / overwrite / create
   unique filename), project date, jobcode, base directory and the two naming
   patterns with `$(` variable auto-completion, plus a live destination
   preview. The copy-only settings are hidden when images are added in place.
-- Below the tabs: the scan frequency and the session **Start/Stop** button.
-  The source folder and the scan frequency are locked while the session
-  runs, since changing the monitored folder behind the engine's back would
-  invalidate its baseline.
+- The session **Start/Stop** button is the notebook's action widget
+  (`gtk_notebook_set_action_widget`), sitting on the tab row itself, to the
+  right of the *Source*/*Destination* labels, instead of taking its own row.
 
 Settings are read from conf at each scan, so most changes take effect on the
 next pass; the scan interval is applied the next time the session starts.
 Monitoring never starts by itself: the user must press **Start** (or accept
 the resume proposal below) in every application session.
+
+**Start** is grayed out until the configuration has the minimum
+`dt_folder_survey_can_start()` requires to succeed: a readable source folder,
+a valid project date, and — only when copying — an existing, writable base
+directory outside the source folder with non-empty naming patterns that
+expand to a valid destination path. The status label shows the specific
+reason it's disabled; the same check gates `dt_folder_survey_start()` itself,
+so the button's state is never out of sync with what pressing it would do.
+Every field that affects this check re-evaluates it on change; **on
+conflict** and **delete original file** don't, since they only affect what
+happens to a conflicting/copied file, never whether the session can start.
 
 The **Base directory of all projects** setting has its own conf key
 (`studio_capture/base_directory_pattern`), independent from the regular
@@ -140,21 +154,62 @@ field starts with a sensible value instead of blank.
 
 ## Style module
 
-An ordered, checkable list of styles automatically applied to every image
-imported during the session. The first checked style replaces the freshly
-imported history (paste mode *replace*), the following ones are stacked on
-top in list order. The selection can be re-applied manually to the displayed
-image. The ordered list is stored in `studio_capture/styles`, separated by
-the ASCII unit separator (0x1F) since style names may contain any printable
-character.
+Two treeviews, **Pool** on top and **Styles** below it. Both carry per-row
+action icons in dedicated fixed-width columns to the right of the name
+column (which is packed with `expand=TRUE` to push them flush right),
+clicked by column identity rather than by current selection — the same
+pattern `develop/blend_gui.c` uses for its mask group rows' unlink/delete
+icons:
+
+- **Pool** — a flat, ordered treeview of the styles actually applied. This is
+  the list used both on import and by the manual apply button below it: the
+  first entry replaces the freshly imported history (paste mode *replace*),
+  the following ones stack on top in pool order. Each row carries an up
+  (`go-up-symbolic`), down (`go-down-symbolic`) and remove
+  (`list-remove-symbolic`) icon, acting directly on the clicked row (no prior
+  selection needed).
+- **Styles** — every available style, grouped into a category tree by
+  splitting the style name on `|` (same convention, and the same tree-building
+  code path as `libs/styles.c`'s own style browser). Leaf rows (actual styles)
+  carry an add icon (`list-add-symbolic`) that appends the style to the end of
+  the pool; category rows have no fullname set, so the icon column hides
+  itself on them. A leaf already in the pool is grayed out and shows a dimmed
+  add icon so it reads as already queued.
+
+  Graying is computed live, per row, by `gtk_tree_view_column_set_cell_data_func()`
+  callbacks (`_studio_style_name_cell_data_func` for the text, gray via
+  "foreground"/"foreground-set", and `_studio_style_add_cell_data_func` for the
+  icon, swapping in a pre-dimmed pixbuf) rather than stored model columns or a
+  "sensitive" binding: individual `GtkCellRenderer`-rendered cells inside a
+  `GtkTreeView` are not separate CSS nodes, so the theme's `*:disabled { opacity }`
+  rule never reaches them — a `sensitive=FALSE` cell disables clicks correctly but
+  renders pixel-identical to an enabled one. The two dimmed/enabled icon variants
+  are pre-rendered once at `gui_init` (`_studio_style_load_icon`, alpha-blended via
+  Cairo) and freed in `gui_cleanup`. Adding or removing a style just calls
+  `gtk_widget_queue_draw()` on the styles treeview, re-evaluating both
+  cell_data_funcs for every visible row — no explicit row lookup needed, and
+  expanded categories are left untouched.
+
+The pool (an ordered `GList` of style names in `studio_style.c`) is the sole
+source of truth, persisted to `studio_capture/styles` separated by the ASCII
+unit separator (0x1F) since style names may contain any printable character.
+The Styles tree is fully rebuilt (and the pool pruned of any name whose style
+vanished) on `DT_SIGNAL_STYLE_CHANGED`, since the available styles themselves
+may have changed.
 
 ## Center view
 
 The center renders the displayed image through the asynchronous surface
 fetcher (`dt_view_image_get_surface_async`), fit-to-window or at 100% with
-panning (double-click, middle-click or scroll toggles the zoom). Every new
-import becomes the displayed image, so the view follows the shooting
-session.
+panning (double-click, middle-click or scroll toggles the zoom; the arrow
+keys pan at 100%, and Ctrl+/- toggles zoom the same as double-click since
+there is no continuous scale to step through). Every new import becomes the
+displayed image, so the view follows the shooting session.
+
+Keyboard navigation must go through `d->zoom`/`pan_x`/`pan_y` — the same
+fields the mouse handlers use — never through `d->dev->roi`: that develop
+only feeds the Scopes module in the background (see below) and never reaches
+the screen, so panning or zooming it has no visible effect.
 
 Behind that display, the view owns its own `dt_develop_t` (`studio_capture.c`)
 that is published as `darktable.develop` for as long as the atelier is
@@ -172,6 +227,39 @@ A full develop-pipeline center (the darkroom's own live zoom/pan and expose
 machinery) remains a possible later upgrade; it would require extracting that
 machinery into a shared unit.
 
+### Opening darkroom
+
+Double-clicking (or pressing Return on) a filmstrip thumbnail only *previews*
+that capture here, without leaving the atelier — this raises the same
+`DT_SIGNAL_VIEWMANAGER_THUMBTABLE_ACTIVATE` signal lighttable uses to open
+darkroom, but Studio Capture's handler (`_studio_filmstrip_activate_callback`)
+just calls `_studio_set_image()` instead, deliberately unchanged so a session
+can be reviewed without ever leaving it.
+
+`_studio_set_image()` — the single function every image-display change goes
+through (filmstrip activate, a new import, the initial selection on
+`enter()`) — keeps `darktable.selection` in sync with whatever it displays,
+via `dt_selection_select_single()`, alongside its own active-image tracking.
+This matters for two reasons: darkroom's `try_enter()` falls back to the
+library selection (not to this view's own active-image tracking) whenever
+nothing is under the mouse, and a newly auto-imported capture should become
+the selected image the same way clicking it in the filmstrip would.
+
+It also mirrors the displayed image into `dt_control_set_mouse_over_id()` and
+`dt_control_set_keyboard_over_id()`, the same pair darkroom's own `enter()`
+sets right before loading an image. darkroom's `try_enter()` checks
+`mouse_over_id` *first*, ahead of the selection fallback above — without this,
+a stale `mouse_over_id` left over from hovering a filmstrip thumbnail could
+win over the selection and send darkroom to the wrong image.
+
+Pressing Return while the *center* has focus (not the filmstrip) opens the
+currently displayed capture in darkroom, via the view's own `key_pressed()`.
+This only fires when the filmstrip hasn't already consumed the key: the
+filmstrip's own key-press-event handler returns `TRUE` for Return, which
+stops GTK from ever reaching the fallback `key_pressed()` path that
+`dt_control_key_pressed()`/`dt_view_manager_key_pressed()` dispatch to the
+current view.
+
 ### Color picker
 
 The Scopes module's color picker works in this view too: point mode, and box
@@ -187,7 +275,7 @@ follows the pointer for as long as the button stays down. The overlay drawing
 `_darkroom_pickers_draw` visual style using this view's own coordinate
 mapping instead of darkroom's zoom/pan transform.
 
-Two module-level singletons complicate reusing the picker outside darkroom:
+Three module-level singletons complicate reusing the picker outside darkroom:
 
 - `dev->color_picker.histogram_module` / `.refresh_global_picker`: the Scopes
   module binds these once, at application startup, onto whichever develop is
@@ -199,9 +287,14 @@ Two module-level singletons complicate reusing the picker outside darkroom:
   separately-allocated `primary_sample` (as `dt_dev_init` gives every
   `gui_attached` develop) computes correct values but has no attached
   widgets, so nothing ever appears on screen.
+- `dev->color_picker.picker`: the toggle button's own `dt_iop_color_picker_t*`
+  closure, one physical widget shared by every view. `_refresh_active_picker()`
+  (`gui/color_picker_proxy.c`) — the handler behind pipe-finished /
+  cacheline-ready re-sampling — bails out unconditionally whenever
+  `dev->color_picker.picker` is `NULL`, regardless of `.enabled`.
 
-`enter()` copies the `histogram_module`/`refresh_global_picker` binding onto
-the viewer's own develop, and additionally **shares darkroom's
+`enter()` copies the `histogram_module`/`refresh_global_picker`/`.picker`
+bindings onto the viewer's own develop, and additionally **shares darkroom's
 `primary_sample` instance** for as long as the atelier is active (stashing
 the viewer's own instance in `own_primary_sample`). Live samples added while
 the atelier is active copy from that shared instance and get freshly created
@@ -209,7 +302,28 @@ widgets of their own, so they work independently of the sharing. `leave()`
 restores `own_primary_sample` before any pipeline teardown; `cleanup()`
 restores it defensively too, in case the application quits while this view
 is still active (so `dt_dev_cleanup()` frees the viewer's own instance,
-never darkroom's shared one).
+never darkroom's shared one). `dt_iop_color_picker_reset()` in `leave()`
+clears `d->dev->color_picker.picker` back to `NULL` as part of turning the
+toggle off, so there is nothing to restore for it symmetrically to
+`own_primary_sample`.
+
+Without the `.picker` copy, switching to Studio Capture with the picker left
+enabled in darkroom left `d->dev->color_picker.picker` at its zero-initialized
+`NULL`: the picker still drew at the right place (drawing only reads
+`primary_sample`, which is shared), but its value never advanced past
+whatever darkroom had last sampled, since automatic re-sampling requires
+`.picker` to be non-`NULL`.
+
+Applying a style (`libs/studio_style.c`) writes straight to the DB through a
+throwaway `dt_develop_t` (`common/styles.c`), so it never touches `d->dev`'s
+in-memory history or pipeline. `_studio_history_changed_callback` — the
+`DT_SIGNAL_DEVELOP_HISTORY_CHANGE` handler raised right after — reloads
+`d->dev`'s history from DB and rebuilds its pipeline (`dt_dev_reload_history_items`
++ `dt_dev_history_pixelpipe_update`) before invalidating the fetcher, so the
+scopes/color-picker samples (sourced from `d->dev`'s preview pipe) refresh
+alongside the center image instead of staying stuck on the pre-style values.
+It skips `dt_dev_history_gui_update()`: that call walks `dev->iop` expecting
+module GUIs to update, which this viewer never initializes.
 
 ## Session resume
 
@@ -263,10 +377,11 @@ when Ansel starts again.
 
 When copy-on-import produces a destination path that already exists,
 `studio_capture/on_conflict` selects the behaviour: **skip** keeps and imports
-the existing destination (legacy behaviour, default), **overwrite** replaces
-it with the source, **create unique filename** copies the source under a
-`_NN` suffixed name. This protects sessions whose naming patterns contain no
-varying variable.
+the existing destination (legacy behaviour), **overwrite** replaces it with
+the source, **create unique filename** copies the source under a `_NN`
+suffixed name (default — a tethering session's naming patterns commonly have
+no variable that changes shot to shot, so skip/overwrite would otherwise
+silently drop or clobber every subsequent capture).
 
 ### Source deletion
 

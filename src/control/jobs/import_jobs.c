@@ -151,7 +151,11 @@ const int32_t _import_job(dt_control_import_t *data, gchar *img_path_to_db)
 
   dt_film_t film;
   const int32_t filmid = dt_film_new(&film, dirname);
-  const int32_t imgid = dt_image_import(filmid, img_path_to_db, FALSE);
+  // Regular imports skip the per-file DT_SIGNAL_IMAGE_IMPORT (large batches
+  // would otherwise raise it hundreds of times). Folder survey imports one or
+  // a few files at a time, and Studio Capture needs that signal to know which
+  // image to display as soon as it lands, so raise it for that case only.
+  const int32_t imgid = dt_image_import(filmid, img_path_to_db, data->folder_survey);
   dt_free(dirname);
   return imgid;
 }
@@ -476,21 +480,18 @@ int32_t _import_image(const GList *img, dt_control_import_t *data, const int ind
       if(!IS_NULL_PTR(data->styles))
       {
         dt_hm_batch_state_t batch = { 0 };
-        gboolean first = TRUE;
         for(GList *s = data->styles; s; s = g_list_next(s))
         {
           const char *style_name = (const char *)s->data;
           const int32_t style_id = dt_styles_get_id_by_name(style_name);
           if(style_id <= 0) continue;
-          dt_styles_apply_to_image_merge(style_name, style_id, imgid,
-                                         first ? DT_HISTORY_MERGE_REPLACE : DT_HISTORY_MERGE_APPEND, &batch);
-          first = FALSE;
+          dt_styles_apply_to_image_merge(style_name, style_id, imgid, DT_HISTORY_MERGE_APPEND, &batch);
         }
         dt_hm_batch_state_cleanup(&batch);
 
         // The styles were written straight to DB: reload cached metadata, drop
         // the stale mipmap and refresh thumbnails (lighttable + filmstrip).
-        if(!first) dt_image_history_changed(imgid, TRUE);
+        dt_image_history_changed(imgid, TRUE);
       }
     }
   }
@@ -508,7 +509,7 @@ static void _refresh_progress_counter(dt_job_t *job, const int elements, const i
   double fraction = (double)index / (double)elements;
   if(folder_survey)
     snprintf(message, sizeof(message),
-             ngettext("Survey importing %i/%i image", "Survey importing %i/%i images", index),
+             ngettext("Capture: importing %i/%i image", "Capture: importing %i/%i images", index),
              index, elements);
   else
     snprintf(message, sizeof(message),
@@ -557,7 +558,7 @@ static int32_t _control_import_job_run(dt_job_t *job)
   if(index == 0)
   {
     if(data->folder_survey)
-      dt_control_log(_("Folder survey did not import any image."));
+      dt_control_log(_("Capture: No image imported!"));
     else
       dt_control_log(_("No image imported!"));
     fprintf(stderr, "No image imported!\n\n");
@@ -566,14 +567,14 @@ static int32_t _control_import_job_run(dt_job_t *job)
   else if(index == 1 && xmps == 1)
   {
     if(data->folder_survey)
-      dt_control_log(_("Folder survey imported 1 image."));
+      dt_control_log(_("Capture: imported 1 image."));
     dt_collection_load_filmroll(darktable.collection, imgid, TRUE);
   }
   else
   {
     if(data->folder_survey)
-      dt_control_log(ngettext("Folder survey imported %d image.",
-                              "Folder survey imported %d images.", index), index);
+      dt_control_log(ngettext("Capture: imported %d image.",
+                              "Capture: imported %d images.", index), index);
     else
       dt_control_log(ngettext("Imported %d image", "Imported %d images", index), index);
     fprintf(stdout, "%d files imported in database.\n\n", index);

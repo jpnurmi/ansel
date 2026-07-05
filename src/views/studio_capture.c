@@ -38,6 +38,7 @@
 #include "develop/pixelpipe_hb.h"
 #include "dtgtk/thumbtable.h"
 #include "gui/color_picker_proxy.h"
+#include "gui/gdkkeys.h"
 #include "gui/gtk.h"
 #include "libs/colorpicker.h"
 #include "libs/lib.h"
@@ -359,6 +360,18 @@ static void _studio_set_image(dt_studio_capture_t *d, const int32_t imgid)
   if(imgid > UNKNOWN_IMAGE)
   {
     dt_view_active_images_add(imgid, TRUE);
+    // Keep the library selection in sync with whatever this view displays
+    // (a new import, a filmstrip activate...): darkroom's try_enter() falls
+    // back to the selection, not to our own active-image tracking, and the
+    // user expects "what's shown" and "what's selected" to be the same thing.
+    dt_selection_select_single(darktable.selection, imgid);
+    // darkroom's try_enter() checks mouse_over_id BEFORE falling back to the
+    // selection, and its own enter() sets both mouse_over_id and
+    // keyboard_over_id to the image it is about to load. Mirror that here so
+    // switching to darkroom from Studio Capture resolves to the displayed
+    // image even if a stale mouse_over_id is lingering from filmstrip hover.
+    dt_control_set_mouse_over_id(imgid);
+    dt_control_set_keyboard_over_id(imgid);
     // Only feed the scopes while the atelier owns the global develop pointer.
     if(darktable.develop == d->dev) _studio_dev_setup(d, imgid);
   }
@@ -412,6 +425,18 @@ static void _studio_history_changed_callback(gpointer instance, gpointer user_da
   dt_studio_capture_t *d = (dt_studio_capture_t *)self->data;
   if(d->imgid <= UNKNOWN_IMAGE) return;
 
+  // The style was written straight to DB (common/styles.c uses a throwaway dev, never
+  // d->dev), so d->dev's in-memory history/pipeline are now stale for the displayed
+  // image. Reload and reprocess them here so the scopes/color-picker samples — which
+  // read from d->dev's preview pipe, not from the fetcher's mipmap-based surface —
+  // catch up at the same time as the center image. Skip dt_dev_history_gui_update():
+  // it walks dev->iop expecting module GUIs, which this viewer never initializes.
+  if(d->dev_loaded && darktable.develop == d->dev)
+  {
+    dt_dev_reload_history_items(d->dev, d->imgid);
+    dt_dev_history_pixelpipe_update(d->dev, TRUE);
+  }
+
   dt_view_image_surface_fetcher_invalidate(&d->fetcher, &d->surface);
   dt_control_queue_redraw_center();
 }
@@ -440,6 +465,14 @@ void enter(dt_view_t *self)
     d->dev->color_picker.refresh_global_picker = darkroom_dev->color_picker.refresh_global_picker;
     if(!IS_NULL_PTR(darkroom_dev->color_picker.primary_sample))
       d->dev->color_picker.primary_sample = darkroom_dev->color_picker.primary_sample;
+    // The Scopes panel's picker toggle button is the same physical widget
+    // regardless of the active view, wired at startup to darkroom_dev's
+    // dt_iop_color_picker_t. _refresh_active_picker() (gui/color_picker_proxy.c)
+    // bails out unconditionally when dev->color_picker.picker is NULL — without
+    // this, our own dev never resamples on pipe-finished/cacheline-ready events,
+    // so the primary sample keeps showing whatever value darkroom last computed
+    // instead of the image displayed here.
+    d->dev->color_picker.picker = darkroom_dev->color_picker.picker;
   }
   dt_iop_color_picker_init();
 
@@ -1069,6 +1102,81 @@ int scrolled(dt_view_t *self, double x, double y, int up, int state, int delta_y
     _studio_toggle_zoom(d, x, y);
     return 1;
   }
+  return 0;
+}
+
+int key_pressed(dt_view_t *self, GdkEventKey *event)
+{
+  dt_studio_capture_t *d = (dt_studio_capture_t *)self->data;
+
+  const gboolean shift = dt_modifier_is(event->state, GDK_SHIFT_MASK);
+  const gboolean ctrl = dt_modifier_is(event->state, GDK_CONTROL_MASK);
+  const gboolean ctrl_any = dt_modifiers_include(event->state, GDK_CONTROL_MASK);
+  guint key = dt_keys_mainpad_alternatives(event->keyval);
+
+  // Studio Capture's visible surface is driven by d->zoom/pan_x/pan_y (see
+  // expose()), not by d->dev->roi: that develop only feeds the Scopes module
+  // in the background and never reaches the screen. Panning or zooming it
+  // has no visible effect, so all navigation below must go through the same
+  // fields the mouse handlers (button_pressed/mouse_moved/scrolled) use.
+  if(ctrl_any && (key == GDK_KEY_plus || key == GDK_KEY_minus))
+  {
+    if((key == GDK_KEY_plus) == (d->zoom == DT_THUMBTABLE_ZOOM_FIT))
+      _studio_toggle_zoom(d, d->width / 2.0, d->height / 2.0);
+    return 1;
+  }
+
+  const double multiplier = shift ? 4.0 : ctrl ? 0.5 : 1.0;
+  const double step = 10.0 * multiplier;
+
+  switch(key)
+  {
+    case GDK_KEY_Return:
+    {
+      if(d->imgid > UNKNOWN_IMAGE)
+      {
+        // _studio_set_image() already synced darktable.selection to d->imgid.
+        dt_view_manager_switch(darktable.view_manager, "darkroom");
+      }
+      else
+        dt_control_log(_("No image to open in darkroom."));
+      return 1;
+    }
+    case GDK_KEY_Up:
+    {
+      if(d->zoom != DT_THUMBTABLE_ZOOM_FULL) return 0;
+      d->pan_y -= step;
+      dt_control_queue_redraw_center();
+      return 1;
+    }
+    case GDK_KEY_Down:
+    {
+      if(d->zoom != DT_THUMBTABLE_ZOOM_FULL) return 0;
+      d->pan_y += step;
+      dt_control_queue_redraw_center();
+      return 1;
+    }
+    case GDK_KEY_Left:
+    {
+      if(d->zoom != DT_THUMBTABLE_ZOOM_FULL) return 0;
+      d->pan_x -= step;
+      dt_control_queue_redraw_center();
+      return 1;
+    }
+    case GDK_KEY_Right:
+    {
+      if(d->zoom != DT_THUMBTABLE_ZOOM_FULL) return 0;
+      d->pan_x += step;
+      dt_control_queue_redraw_center();
+      return 1;
+    }
+    case GDK_KEY_Escape:
+    {
+      dt_ctl_switch_mode_to("lighttable");
+      return TRUE;
+    }
+  }
+
   return 0;
 }
 

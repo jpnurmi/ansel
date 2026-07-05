@@ -271,13 +271,14 @@ static int _folder_survey_collect(const char *folder, GHashTable *observed)
 /**
  * @brief Read the ordered auto-apply style list from conf.
  *
- * Styles are a Studio Capture feature: outside that view the survey imports
- * plain files, so the caller only gets a list when the view is active.
+ * Styles are a Studio Capture feature, the survey runs in the background
+ * regardless of the active view, so styles are applied even if the user
+ * has switched away from Studio Capture while a session keeps monitoring.
  */
 static GList *_folder_survey_styles_for_import()
 {
   const dt_view_t *view = dt_view_manager_get_current_view(darktable.view_manager);
-  if(IS_NULL_PTR(view) || strcmp(view->module_name, "studio_capture")) return NULL;
+  if(IS_NULL_PTR(view)) return NULL;
 
   char *conf = dt_conf_get_string(DT_FOLDER_SURVEY_STYLES_CONF_KEY);
   if(IS_NULL_PTR(conf) || conf[0] == '\0')
@@ -673,24 +674,18 @@ char *dt_folder_survey_destination_preview()
   return path;
 }
 
-/**
- * @brief Validate the persisted survey configuration.
- *
- * @param message receives a translated, static error string on failure.
- * @return int 0 when the configuration can start monitoring.
- */
-static int _folder_survey_validate_conf(const char **message)
+gboolean dt_folder_survey_can_start(const char **message)
 {
   const char *folder = dt_conf_get_string_const("studio_capture/folder");
   if(IS_NULL_PTR(folder) || folder[0] == '\0' || !g_file_test(folder, G_FILE_TEST_IS_DIR))
   {
     *message = _("The folder to survey does not exist.");
-    return 1;
+    return FALSE;
   }
   if(g_access(folder, R_OK | X_OK) != 0)
   {
     *message = _("The folder to survey is not readable.");
-    return 1;
+    return FALSE;
   }
 
   const char *date = dt_conf_get_string_const("studio_capture/datetime");
@@ -698,34 +693,34 @@ static int _folder_survey_validate_conf(const char **message)
   if(!IS_NULL_PTR(date) && date[0] && !dt_datetime_entry_to_exif(datetime, sizeof(datetime), date))
   {
     *message = _("The project date is invalid.");
-    return 1;
+    return FALSE;
   }
 
-  if(!dt_conf_get_bool("studio_capture/copy")) return 0;
+  if(!dt_conf_get_bool("studio_capture/copy")) return TRUE;
 
   const char *target = dt_conf_get_string_const("studio_capture/base_directory_pattern");
   if(IS_NULL_PTR(target) || target[0] == '\0' || !g_file_test(target, G_FILE_TEST_IS_DIR))
   {
     *message = _("The base directory of all projects does not exist.");
-    return 1;
+    return FALSE;
   }
   if(!dt_util_test_writable_dir(target))
   {
     *message = _("The base directory of all projects is not writable.");
-    return 1;
+    return FALSE;
   }
 
   const char *subfolder = dt_conf_get_string_const("studio_capture/sub_directory_pattern");
   if(IS_NULL_PTR(subfolder) || subfolder[0] == '\0')
   {
     *message = _("The project directory naming pattern is empty.");
-    return 1;
+    return FALSE;
   }
   const char *file_pattern = dt_conf_get_string_const("studio_capture/filename_pattern");
   if(IS_NULL_PTR(file_pattern) || file_pattern[0] == '\0')
   {
     *message = _("The file naming pattern is empty.");
-    return 1;
+    return FALSE;
   }
 
   char *canonical_folder = g_canonicalize_filename(folder, NULL);
@@ -741,18 +736,18 @@ static int _folder_survey_validate_conf(const char **message)
   if(target_inside_source)
   {
     *message = _("The base directory cannot be inside the surveyed folder.");
-    return 1;
+    return FALSE;
   }
 
   char *preview = dt_folder_survey_destination_preview();
   if(IS_NULL_PTR(preview))
   {
     *message = _("The configured destination path is invalid.");
-    return 1;
+    return FALSE;
   }
   dt_free(preview);
 
-  return 0;
+  return TRUE;
 }
 
 void dt_folder_survey_init()
@@ -862,7 +857,7 @@ int dt_folder_survey_start()
   if(!_folder_survey.initialized) dt_folder_survey_init();
 
   const char *message = NULL;
-  if(_folder_survey_validate_conf(&message))
+  if(!dt_folder_survey_can_start(&message))
   {
     dt_control_log("%s", message);
     return 1;

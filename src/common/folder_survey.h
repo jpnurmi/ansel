@@ -49,6 +49,17 @@ void dt_folder_survey_halt();
 gboolean dt_folder_survey_is_active();
 
 /**
+ * @brief Check, without any side effect, whether the persisted configuration
+ * has everything dt_folder_survey_start() requires to succeed.
+ *
+ * @param message receives a translated, static explanation when the
+ * configuration is incomplete or invalid; left untouched otherwise. Safe to
+ * display directly in the GUI (e.g. as a status label or tooltip).
+ * @return gboolean TRUE when dt_folder_survey_start() would succeed.
+ */
+gboolean dt_folder_survey_can_start(const char **message);
+
+/**
  * @brief TRUE when the previous application session quit while monitoring.
  */
 gboolean dt_folder_survey_session_was_active();
