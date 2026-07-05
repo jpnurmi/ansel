@@ -40,8 +40,10 @@
 #include "gui/color_picker_proxy.h"
 #include "gui/gdkkeys.h"
 #include "gui/gtk.h"
+#include "gui/guides.h"
 #include "libs/colorpicker.h"
 #include "libs/lib.h"
+#include "views/dev_backbuf.h"
 #include "views/dev_toolbox.h"
 #include "views/view.h"
 #include "views/view_api.h"
@@ -95,13 +97,24 @@ typedef struct dt_studio_capture_t
   // Own develop instance. While the atelier is active it is published as
   // darktable.develop and runs the pixelpipe on the displayed image so the
   // scopes (which read darktable.develop->preview_pipe) have data to show.
-  // The center is still drawn from the surface fetcher; this pipeline is only
-  // there to feed the scopes, not the main display.
+  // At DT_THUMBTABLE_ZOOM_FIT, expose() also prefers this pipe's own live
+  // backbuf (main_locked/main_wait below) over the plain surface fetcher when
+  // it is ready, since that is the only path that bakes in ISO 12646/
+  // overexposed/raw overexposed/softproof/gamut. The fetcher's surface stays
+  // the fallback (cold start, or 100% zoom, which this dev's ROI never
+  // reflects - see _studio_configure_dev_roi) and the only source the color
+  // picker's coordinate mapping (_studio_widget_to_image_norm) ever reads.
   dt_develop_t *dev;
   dt_develop_t *saved_develop; // global develop pointer to restore on leave
   gboolean dev_loaded;         // an image is loaded and its pipelines are set up
   int dev_width;               // last center allocation, for dt_dev_configure()
   int dev_height;
+
+  // dev->pipe's live backbuf, GUI-side view (see dev_backbuf.h). Must be
+  // released (dt_dev_release_locked_surface) before dev's pipeline nodes are
+  // torn down - see _studio_dev_teardown().
+  dt_dev_locked_surface_t main_locked;
+  dt_dev_pixelpipe_cache_wait_t main_wait;
 
   // The Scopes module's "current pick" readout (numeric label + swatch) is a
   // GTK widget pair created once, at startup, hard-wired via signal user_data
@@ -129,6 +142,9 @@ void init(dt_view_t *self)
   dt_studio_capture_t *d = calloc(1, sizeof(dt_studio_capture_t));
   d->imgid = UNKNOWN_IMAGE;
   d->zoom = DT_THUMBTABLE_ZOOM_FIT;
+  // calloc() zero-initializes main_locked.hash to 0, which looks like a valid hash, not the
+  // "never locked" sentinel dt_dev_lock_pipe_surface()/dt_dev_release_locked_surface() expect.
+  d->main_locked.hash = DT_PIXELPIPE_CACHE_HASH_INVALID;
   dt_view_image_surface_fetcher_init(&d->fetcher);
 
   // gui_attached = 1: the scopes only read a develop whose preview pipe is a
@@ -198,6 +214,20 @@ int try_enter(dt_view_t *self)
  *
  * Requires darktable.develop == d->dev (set by enter()).
  */
+/**
+ * @brief Feed the current center allocation into the dev's ROI and re-derive
+ * border_size from dev->iso_12646.enabled (dt_dev_toolbox_apply_iso_12646_size()
+ * calls dt_dev_configure() internally). Centralizes what _studio_dev_setup(),
+ * configure() and expose()'s resize catch-up all need, so toggling ISO 12646
+ * survives a resize instead of being stomped back to border_size=0.
+ */
+static void _studio_configure_dev_roi(dt_studio_capture_t *d, int width, int height)
+{
+  d->dev->roi.orig_width = width;
+  d->dev->roi.orig_height = height;
+  dt_dev_toolbox_apply_iso_12646_size(d->dev);
+}
+
 static void _studio_dev_setup(dt_studio_capture_t *d, const int32_t imgid)
 {
   dt_develop_t *dev = d->dev;
@@ -224,12 +254,7 @@ static void _studio_dev_setup(dt_studio_capture_t *d, const int32_t imgid)
   // Size the pipelines to the current center allocation so the preview pipe
   // (the scopes' source) produces a valid buffer.
   if(d->dev_width > 0 && d->dev_height > 0)
-  {
-    dev->roi.orig_width = d->dev_width;
-    dev->roi.orig_height = d->dev_height;
-    dev->roi.border_size = 0;
-    dt_dev_configure(dev, d->dev_width, d->dev_height);
-  }
+    _studio_configure_dev_roi(d, d->dev_width, d->dev_height);
 
   dt_dev_start_all_pipelines(dev);
 }
@@ -247,6 +272,11 @@ static void _studio_dev_teardown(dt_studio_capture_t *d)
 {
   if(!d->dev_loaded) return;
   d->dev_loaded = FALSE;
+
+  // Must happen before the pipe nodes/backbufs below are torn down: main_locked otherwise keeps
+  // referencing a cache entry that is about to be invalidated/reused by the next image's pipe.
+  dt_dev_release_locked_surface(&d->main_locked);
+  dt_dev_pixelpipe_cache_wait_cleanup(&d->main_wait, "studio-capture-release-main");
 
   dt_develop_t *dev = d->dev;
 
@@ -562,13 +592,7 @@ void configure(dt_view_t *self, int width, int height)
   d->dev_height = height;
 
   // Re-size the running pipelines to the new center allocation.
-  if(d->dev_loaded)
-  {
-    d->dev->roi.orig_width = width;
-    d->dev->roi.orig_height = height;
-    d->dev->roi.border_size = 0;
-    dt_dev_configure(d->dev, width, height);
-  }
+  if(d->dev_loaded) _studio_configure_dev_roi(d, width, height);
 }
 
 void reset(dt_view_t *self)
@@ -793,22 +817,28 @@ void expose(dt_view_t *self, cairo_t *cr, int32_t width, int32_t height, int32_t
   {
     d->dev_width = width;
     d->dev_height = height;
-    d->dev->roi.orig_width = width;
-    d->dev->roi.orig_height = height;
-    d->dev->roi.border_size = 0;
-    dt_dev_configure(d->dev, width, height);
+    _studio_configure_dev_roi(d, width, height);
   }
 
+  dt_aligned_pixel_t bg_color = { 0.0f };
+  dt_dev_get_background_color(d->dev, bg_color);
+  cairo_set_source_rgb(cr, bg_color[0], bg_color[1], bg_color[2]);
   cairo_paint(cr);
 
   if(d->imgid <= UNKNOWN_IMAGE) return;
 
+  // Always fetch/refresh the mipmap surface first: _studio_widget_to_image_norm() (the color
+  // picker's click-to-image-point mapping, in button_pressed/mouse_moved) keys off its
+  // dimensions via _studio_surface_geometry(), so both must stay valid and current even on
+  // frames where the live backbuf below ends up being what actually gets painted. Cheap: this
+  // is a cached async fetch, not a re-decode, on frames where nothing relevant changed.
   const dt_view_surface_value_t res
       = dt_view_image_get_surface_async(&d->fetcher, d->imgid, MAX(2, width), MAX(2, height), &d->surface,
                                         dt_ui_center(darktable.gui->ui), d->zoom);
   if(res != DT_VIEW_SURFACE_OK || IS_NULL_PTR(d->surface))
   {
     dt_control_draw_busy_msg(cr, width, height);
+    dt_dev_draw_profile_mode_label(cr, height);
     return;
   }
 
@@ -829,15 +859,64 @@ void expose(dt_view_t *self, cairo_t *cr, int32_t width, int32_t height, int32_t
   _studio_surface_geometry(d, &tr_x, &tr_y, &logical_width, &logical_height);
   if(d->zoom != DT_THUMBTABLE_ZOOM_FIT) _studio_clamp_pan(d, logical_width, logical_height);
 
-  cairo_save(cr);
-  cairo_translate(cr, tr_x, tr_y);
-  cairo_set_source_surface(cr, d->surface, 0, 0);
-  cairo_pattern_set_filter(cairo_get_source(cr), darktable.gui->filter_image);
-  cairo_rectangle(cr, 0, 0, logical_width, logical_height);
-  cairo_fill(cr);
-  cairo_restore(cr);
+  // Prefer the live main pipe's backbuf over the plain mipmap thumbnail: it is what actually
+  // bakes in ISO 12646/overexposed/raw overexposed/softproof/gamut, none of which the mipmap
+  // fetcher above is aware of. Only meaningful at FIT: d->dev->roi never reflects zoom/pan (see
+  // _studio_configure_dev_roi), so at 100% this pipe is always framed as "fit", not "100%" -
+  // trying to show it there would just display the wrong framing under the wrong label. Falls
+  // back to the mipmap surface (translated/sized by the geometry above) whenever the live
+  // backbuf is not ready yet (cold start, image just switched) or zoom is 100%.
+  gboolean drew_live = FALSE;
+  if(d->zoom == DT_THUMBTABLE_ZOOM_FIT
+     && dt_dev_lock_pipe_surface(d->dev, d->dev->pipe, &d->main_locked, &d->main_wait, "studio-capture-main", TRUE)
+     && d->main_locked.surface)
+  {
+    // dt_dev_render_locked_surface() translates cr directly with no save/restore of its own:
+    // darkroom always calls it on a throwaway intermediate context it discards right after, but
+    // this view draws everything (including the guides below) on the same cr, so the translate
+    // must not leak past this call.
+    cairo_save(cr);
+    drew_live = dt_dev_render_locked_surface(cr, d->dev, &d->main_locked, width, height,
+                                             d->dev->roi.border_size, bg_color);
+    cairo_restore(cr);
+  }
+
+  if(!drew_live)
+  {
+    cairo_save(cr);
+    cairo_translate(cr, tr_x, tr_y);
+    if(d->zoom == DT_THUMBTABLE_ZOOM_FIT && d->dev->iso_12646.enabled)
+      dt_dev_draw_iso12646_border(cr, logical_width, logical_height, d->dev->roi.border_size);
+    cairo_set_source_surface(cr, d->surface, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(cr), darktable.gui->filter_image);
+    cairo_rectangle(cr, 0, 0, logical_width, logical_height);
+    cairo_fill(cr);
+    cairo_restore(cr);
+  }
+
+  // Guide lines: the toggle button (darktable.view_manager->guides_toggle, wired up in
+  // darkroom.c's gui_init) is already shared into this view's toolbox, but its state and
+  // dt_guides_draw() itself read only global conf, independent of any dev - only the
+  // clip/transform setup below is dev-driven. Only meaningful at FIT, same reasoning as the
+  // live backbuf above: d->dev->roi always describes "fit", never this view's own 100%/pan.
+  if(d->zoom == DT_THUMBTABLE_ZOOM_FIT)
+  {
+    const float wd = d->dev->roi.preview_width;
+    const float ht = d->dev->roi.preview_height;
+    const float scaling = dt_dev_get_overlay_scale(d->dev);
+
+    cairo_save(cr);
+    // don't draw guides on image margins
+    dt_dev_clip_roi(d->dev, cr, width, height);
+    // place origin at top-left corner of image
+    dt_dev_rescale_roi(d->dev, cr, width, height);
+
+    dt_guides_draw(cr, 0, 0, wd, ht, scaling);
+    cairo_restore(cr);
+  }
 
   _studio_draw_pickers(d, cr);
+  dt_dev_draw_profile_mode_label(cr, height);
 }
 
 /**
