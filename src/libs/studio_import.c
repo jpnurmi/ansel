@@ -63,7 +63,7 @@ typedef struct dt_lib_studio_import_t
 
 const char *name(dt_lib_module_t *self)
 {
-  return _("Import");
+  return _("Auto import");
 }
 
 const char **views(dt_lib_module_t *self)
