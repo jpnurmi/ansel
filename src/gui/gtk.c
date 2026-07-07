@@ -2248,6 +2248,7 @@ void dt_gui_load_theme(const char *theme)
     [DT_GUI_COLOR_MAP_LOC_SHAPE_HIGH] = { "map_count_circle_color_h", { 1.0, 1.0, 0.8, 1.0 } },
     [DT_GUI_COLOR_MAP_LOC_SHAPE_LOW] = { "map_count_circle_color_l", { 0.0, 0.0, 0.0, 1.0 } },
     [DT_GUI_COLOR_MAP_LOC_SHAPE_DEF] = { "map_count_circle_color_d", { 1.0, 0.0, 0.0, 1.0 } },
+    [DT_GUI_COLOR_WARNING] = { "warning_color", { 1.0, 0.647, 0.0, 1.0 } },
   };
 
   // starting from 1 as DT_GUI_COLOR_BG is not part of this table
