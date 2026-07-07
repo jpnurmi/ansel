@@ -358,6 +358,18 @@ static inline GdkPixbuf *dt_gdk_pixbuf_new_from_file_at_size(const char *filenam
 void dt_gui_add_class(GtkWidget *widget, const gchar *class_name);
 void dt_gui_remove_class(GtkWidget *widget, const gchar *class_name);
 
+/**
+ * @brief Set a symbolic icon on an image widget, optionally forcing a specific color.
+ *
+ * gtk_image_set_from_icon_name() colors symbolic icons from the current CSS "color", but
+ * ansel.css's main theme provider is loaded at GTK_STYLE_PROVIDER_PRIORITY_USER + 1 (gui/gtk.c),
+ * which outranks any per-widget provider added at the more common
+ * GTK_STYLE_PROVIDER_PRIORITY_APPLICATION and silently wins the cascade. Loading the icon as a
+ * pre-tinted pixbuf via GtkIconInfo sidesteps CSS entirely, so the requested color always wins.
+ * Pass color = NULL for the normal (untinted, theme-foreground) rendering.
+ */
+void dt_gui_set_symbolic_icon(GtkWidget *image, const char *icon_name, GtkIconSize size, const GdkRGBA *color);
+
 int dt_gui_gtk_init(dt_gui_gtk_t *gui);
 void dt_gui_gtk_run(dt_gui_gtk_t *gui);
 void dt_gui_gtk_quit();

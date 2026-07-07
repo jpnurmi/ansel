@@ -150,6 +150,38 @@ void dt_gui_remove_class(GtkWidget *widget, const gchar *class_name)
   }
 }
 
+void dt_gui_set_symbolic_icon(GtkWidget *image, const char *icon_name, GtkIconSize size, const GdkRGBA *color)
+{
+  gint width = 16, height = 16;
+  gtk_icon_size_lookup(size, &width, &height);
+  // Icon themes only look up square icons: request the larger dimension,
+  // then scale the result down to the exact width/height below if the two differ.
+  GtkIconInfo *info = gtk_icon_theme_lookup_icon(gtk_icon_theme_get_default(), icon_name, MAX(width, height),
+                                                 GTK_ICON_LOOKUP_FORCE_SYMBOLIC);
+  if(IS_NULL_PTR(info))
+  {
+    gtk_image_set_from_icon_name(GTK_IMAGE(image), icon_name, size);
+    return;
+  }
+
+  GdkPixbuf *pixbuf = IS_NULL_PTR(color)
+      ? gtk_icon_info_load_symbolic_for_context(info, gtk_widget_get_style_context(image), NULL, NULL)
+      : gtk_icon_info_load_symbolic(info, color, color, color, color, NULL, NULL);
+  g_object_unref(info);
+
+  if(!IS_NULL_PTR(pixbuf))
+  {
+    if(gdk_pixbuf_get_width(pixbuf) != width || gdk_pixbuf_get_height(pixbuf) != height)
+    {
+      GdkPixbuf *scaled = gdk_pixbuf_scale_simple(pixbuf, width, height, GDK_INTERP_BILINEAR);
+      g_object_unref(pixbuf);
+      pixbuf = scaled;
+    }
+    gtk_image_set_from_pixbuf(GTK_IMAGE(image), pixbuf);
+    g_object_unref(pixbuf);
+  }
+}
+
 /* ------------------------------------------------------------------------------------------
  * Widget-callback suppression depth (see common/darktable.h for the rationale and API).
  * ------------------------------------------------------------------------------------------ */
