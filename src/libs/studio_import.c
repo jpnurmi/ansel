@@ -294,62 +294,74 @@ void gui_init(dt_lib_module_t *self)
 
   /* Session controls: scan frequency + status, at the top of the module */
   
-  GtkWidget *control_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_GUI_BOX_SPACING);
+  GtkWidget *control_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-  d->datetime = gtk_entry_new();
-  gtk_entry_set_text(GTK_ENTRY(d->datetime), dt_conf_get_string_const("studio_capture/datetime"));
-  gtk_entry_set_placeholder_text(GTK_ENTRY(d->datetime), _("Current date at scan time"));
-  // dt_string_to_datetime() (common/datetime.c) overlays the typed text onto the
-  // "0001-01-01 00:00:00.000" template byte-for-byte: a partial value is valid and gets the
-  // untyped tail filled from the template (e.g. "2026" -> 2026-01-01 00:00:00.000), but the
-  // format itself (dashes/space/colons/dot at these exact positions) must match. The calendar
-  // picker below only ever fills in the YYYY-MM-DD part, which always matches.
-  gtk_widget_set_tooltip_text(d->datetime,
-                              _("Format: YYYY-MM-DD, optionally followed by HH:MM:SS.mmm\n"
-                                "Partial values are completed with defaults, e.g. \"2026\" becomes "
-                                "2026-01-01.\n"
-                                "Leave empty to use the current date at scan time."));
-  g_signal_connect(G_OBJECT(d->datetime), "changed", G_CALLBACK(_studio_import_datetime_callback), d);
+  GtkWidget *datetime_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_GUI_BOX_SPACING);
+  {
+    GtkWidget *datetime_label = gtk_label_new(_("Project date"));
+    gtk_widget_set_halign(datetime_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(datetime_box), datetime_label, FALSE, FALSE, 0);
 
-  // Same calendar-popover date picker as the regular Import dialog (common/import.c).
-  GtkWidget *calendar = gtk_calendar_new();
-  GDateTime *now = g_date_time_new_now_local();
-  // GtkCalendar uses months in [0:11]. Glib GDateTime returns months in [1:12].
-  gtk_calendar_select_month(GTK_CALENDAR(calendar), g_date_time_get_month(now) - 1, g_date_time_get_year(now));
-  const guint today = g_date_time_get_day_of_month(now);
-  gtk_calendar_select_day(GTK_CALENDAR(calendar), today);
-  gtk_calendar_mark_day(GTK_CALENDAR(calendar), today);
-  g_date_time_unref(now);
-  GtkBox *box_datetime = attach_popover(d->datetime, "appointment-new-symbolic", calendar);
-  g_signal_connect(G_OBJECT(calendar), "day-selected", G_CALLBACK(_studio_import_update_date), d->datetime);
+    d->datetime = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(d->datetime), dt_conf_get_string_const("studio_capture/datetime"));
+    gtk_entry_set_placeholder_text(GTK_ENTRY(d->datetime), _("Current date at import time"));
+    gtk_widget_set_tooltip_text(d->datetime,
+                                _("Format: YYYY-MM-DD, optionally followed by HH:MM:SS.mmm\n"
+                                  "Partial values are completed with defaults, e.g. \"2026\" becomes "
+                                  "2026-01-01.\n"
+                                  "Leave empty to use the current date at import time."));
+    g_signal_connect(G_OBJECT(d->datetime), "changed", G_CALLBACK(_studio_import_datetime_callback), d);
 
-  _studio_import_pack_row(GTK_BOX(control_box), _("Project date"), GTK_WIDGET(box_datetime));
+    // Same calendar-popover date picker as the regular Import dialog (common/import.c).
+    GtkWidget *calendar = gtk_calendar_new();
+    GDateTime *now = g_date_time_new_now_local();
+    // GtkCalendar uses months in [0:11]. Glib GDateTime returns months in [1:12].
+    gtk_calendar_select_month(GTK_CALENDAR(calendar), g_date_time_get_month(now) - 1, g_date_time_get_year(now));
+    const guint today = g_date_time_get_day_of_month(now);
+    gtk_calendar_select_day(GTK_CALENDAR(calendar), today);
+    gtk_calendar_mark_day(GTK_CALENDAR(calendar), today);
+    g_date_time_unref(now);
+    GtkBox *box_datetime = attach_popover(d->datetime, "appointment-new-symbolic", calendar);
+    g_signal_connect(G_OBJECT(calendar), "day-selected", G_CALLBACK(_studio_import_update_date), d->datetime);
+    gtk_widget_set_valign(GTK_WIDGET(box_datetime), GTK_ALIGN_START);
 
-  d->jobcode = gtk_entry_new();
-  gtk_entry_set_text(GTK_ENTRY(d->jobcode), dt_conf_get_string_const("studio_capture/jobcode"));
-  g_signal_connect(G_OBJECT(d->jobcode), "changed", G_CALLBACK(_studio_import_jobcode_callback), d);
-  _studio_import_pack_row(GTK_BOX(control_box), _("Jobcode"), d->jobcode);
-  
-  d->interval = gtk_spin_button_new_with_range(2, 3600, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(d->interval),
-                            CLAMP(dt_conf_get_int("studio_capture/interval"), 2, 3600));
-  gtk_widget_set_tooltip_text(d->interval, _("Applied the next time the session is started"));
-  g_signal_connect(G_OBJECT(d->interval), "value-changed", G_CALLBACK(_studio_import_interval_callback), d);
-  _studio_import_pack_row(GTK_BOX(control_box), _("Scan frequency (seconds)"), d->interval);
+    gtk_box_pack_start(GTK_BOX(datetime_box), GTK_WIDGET(box_datetime), FALSE, FALSE, 0);
+
+  }
+  gtk_box_pack_start(GTK_BOX(control_box), datetime_box, FALSE, FALSE, 0);
+
+  GtkWidget *jobcode_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_GUI_BOX_SPACING);
+  {
+    GtkWidget *jobcode_label = gtk_label_new(_("Jobcode"));
+    gtk_widget_set_halign(jobcode_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(jobcode_box), jobcode_label, FALSE, FALSE, 0);
+
+    d->jobcode = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(d->jobcode), dt_conf_get_string_const("studio_capture/jobcode"));
+    g_signal_connect(G_OBJECT(d->jobcode), "changed", G_CALLBACK(_studio_import_jobcode_callback), d);
+    gtk_box_pack_start(GTK_BOX(jobcode_box), d->jobcode, TRUE, TRUE, 0);
+  }
+  gtk_box_pack_start(GTK_BOX(control_box), jobcode_box, TRUE, TRUE, 0);
+
+  GtkWidget *interval_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_GUI_BOX_SPACING);
+  {
+    GtkWidget *interval_label = gtk_label_new(_("Scan frequency (seconds)"));
+    gtk_widget_set_halign(interval_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(interval_box), interval_label, FALSE, FALSE, 0);
+
+    d->interval = gtk_spin_button_new_with_range(2, 3600, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(d->interval),
+                              CLAMP(dt_conf_get_int("studio_capture/interval"), 2, 60));
+    gtk_widget_set_tooltip_text(d->interval, _("Applied the next time the session is started"));
+    g_signal_connect(G_OBJECT(d->interval), "value-changed", G_CALLBACK(_studio_import_interval_callback), d);
+    gtk_box_pack_start(GTK_BOX(interval_box), d->interval, TRUE, TRUE, 0);
+  }
+  gtk_box_pack_start(GTK_BOX(control_box), interval_box, TRUE, TRUE, 0);
 
   d->status = gtk_label_new("");
   gtk_widget_set_halign(d->status, GTK_ALIGN_START);
-  // Leave valign at its GTK_ALIGN_FILL default and yalign at its GtkLabel default (0.5): the
-  // label fills status_box's full height (set by the 2-line size_request below) and centers a
-  // shorter, one-line message within it -- status_icon's own valign is set to match (CENTER,
-  // not START) so the icon tracks wherever the text actually sits instead of pinning to the top
-  // of the reserved 2-line block.
   gtk_label_set_line_wrap(GTK_LABEL(d->status), TRUE);
   gtk_label_set_ellipsize(GTK_LABEL(d->status), PANGO_ELLIPSIZE_MIDDLE);
-  // Caps wrapping/ellipsizing at 2 lines, but by itself this only bounds the maximum: a
-  // one-line message still requests a one-line-tall widget. Reserve the 2-line height
-  // up-front too, so the panel doesn't jump when the status message grows from one line to
-  // two (e.g. switching from "Ready to start the session." to a longer disabled-reason message).
   gtk_label_set_lines(GTK_LABEL(d->status), 2);
   PangoLayout *status_layout = gtk_widget_create_pango_layout(d->status, "Xg\nXg");
   int status_width, status_height;
@@ -365,6 +377,7 @@ void gui_init(dt_lib_module_t *self)
   gtk_box_pack_start(GTK_BOX(status_box), d->status_icon, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(status_box), d->status, TRUE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(control_box), status_box, FALSE, FALSE, 0);
+  gtk_widget_set_margin_bottom(control_box, DT_GUI_BOX_SPACING);
 
   gtk_box_pack_start(GTK_BOX(self->widget), control_box, FALSE, FALSE, 0);
 
@@ -390,15 +403,24 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_show(d->toggle);
 
   /* Source tab */
-  d->source_folder
-      = gtk_file_chooser_button_new(_("Select a folder to survey"), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER);
-  const char *folder = dt_conf_get_string_const("studio_capture/folder");
-  if(!IS_NULL_PTR(folder) && folder[0])
-    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(d->source_folder), folder);
-  gtk_widget_set_tooltip_text(d->source_folder, _("Folder receiving the captured images to monitor"));
-  g_signal_connect(G_OBJECT(d->source_folder), "file-set",
-                   G_CALLBACK(_studio_import_source_folder_callback), d);
-  _studio_import_pack_row(GTK_BOX(source_page), _("Folder to survey"), d->source_folder);
+
+  GtkWidget *source_folder_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_GUI_BOX_SPACING);
+  {
+    GtkWidget *source_folder_label = gtk_label_new(_("Source"));
+    gtk_widget_set_halign(source_folder_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(source_folder_box), source_folder_label, FALSE, FALSE, 0);
+
+    d->source_folder = gtk_file_chooser_button_new(_("Select a folder to survey"),
+                                       GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER);
+    const char *folder = dt_conf_get_string_const("studio_capture/folder");
+    if(!IS_NULL_PTR(folder) && folder[0])
+      gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(d->source_folder), folder);
+    gtk_widget_set_tooltip_text(d->source_folder, _("Folder receiving the captured images to monitor"));
+    g_signal_connect(G_OBJECT(d->source_folder), "file-set",
+                                          G_CALLBACK(_studio_import_source_folder_callback), d);
+    gtk_box_pack_start(GTK_BOX(source_folder_box), d->source_folder, TRUE, TRUE, 0);
+  }
+  gtk_box_pack_start(GTK_BOX(source_page), source_folder_box, FALSE, FALSE, 0);
 
   d->delete_source = gtk_check_button_new_with_label(_("Delete original file"));
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->delete_source),
@@ -416,7 +438,7 @@ void gui_init(dt_lib_module_t *self)
                                 GINT_TO_POINTER(1), NULL, TRUE);
   dt_bauhaus_combobox_set(d->copy, dt_conf_get_bool("studio_capture/copy"));
   g_signal_connect(G_OBJECT(d->copy), "value-changed", G_CALLBACK(_studio_import_copy_callback), d);
-  gtk_box_pack_start(GTK_BOX(destination_page), d->copy, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(destination_page), d->copy, FALSE, FALSE, 0);
 
 
   d->copy_options = gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_GUI_BOX_SPACING);
@@ -441,7 +463,7 @@ void gui_init(dt_lib_module_t *self)
   }
   gtk_box_pack_start(GTK_BOX(d->copy_options), d->on_conflict, TRUE, TRUE, 0);
 
-  GtkWidget *base_folder_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  GtkWidget *base_folder_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_GUI_BOX_SPACING);
   {
     GtkWidget *base_folder_label = gtk_label_new(_("Base directory"));
     gtk_widget_set_halign(base_folder_label, GTK_ALIGN_START);
