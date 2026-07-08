@@ -2017,6 +2017,119 @@ gboolean dt_gui_show_standalone_yes_no_dialog(const char *title, const char *mar
   return result.result == RESULT_YES;
 }
 
+typedef struct _three_choice_result_t
+{
+  int result;
+  GtkWidget *window, *button_first, *button_second, *button_third;
+} _three_choice_result_t;
+
+static void _three_choice_button_handler(GtkButton *button, gpointer data)
+{
+  _three_choice_result_t *result = (_three_choice_result_t *)data;
+
+  if((void *)button == (void *)result->button_first)
+    result->result = 0;
+  else if((void *)button == (void *)result->button_second)
+    result->result = 1;
+  else if((void *)button == (void *)result->button_third)
+    result->result = 2;
+
+  gtk_widget_destroy(result->window);
+  _gtk_main_quit_safe(NULL, NULL);
+}
+
+int dt_gui_show_standalone_three_choice_dialog(const char *title, const char *markup, const char *first_text,
+                                               const char *second_text, const char *third_text)
+{
+  GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+#ifdef GDK_WINDOWING_QUARTZ
+  dt_osx_disallow_fullscreen(window);
+#endif
+
+  // themes not yet loaded, no CSS add some manual padding
+  const int padding = darktable.themes ? 0 : 5;
+
+  gtk_window_set_icon_name(GTK_WINDOW(window), "ansel");
+  gtk_window_set_title(GTK_WINDOW(window), title);
+  g_signal_connect(window, "destroy", G_CALLBACK(_gtk_main_quit_safe), NULL);
+
+  gtk_window_set_position(GTK_WINDOW(window), GTK_WIN_POS_CENTER);
+
+  if(!IS_NULL_PTR(darktable.gui) && !IS_NULL_PTR(darktable.gui->ui)
+     && !IS_NULL_PTR(darktable.gui->ui->main_window))
+  {
+    GtkWidget *main_window = dt_ui_main_window(darktable.gui->ui);
+    if(GTK_IS_WINDOW(main_window))
+    {
+      GtkWindow *win = GTK_WINDOW(main_window);
+      gtk_window_set_transient_for(GTK_WINDOW(window), win);
+      gtk_window_set_modal(GTK_WINDOW(window), TRUE);
+      if(gtk_widget_get_visible(GTK_WIDGET(win)))
+      {
+        gtk_window_set_position(GTK_WINDOW(window), GTK_WIN_POS_CENTER_ON_PARENT);
+      }
+    }
+  }
+
+  GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_GUI_BOX_SPACING);
+  gtk_container_add(GTK_CONTAINER(window), vbox);
+
+  GtkWidget *mhbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_GUI_BOX_SPACING);
+  gtk_box_pack_start(GTK_BOX(vbox), mhbox, TRUE, TRUE, padding);
+
+  if(padding)
+  {
+    gtk_box_pack_start(GTK_BOX(mhbox),
+                       gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_GUI_BOX_SPACING), TRUE, TRUE, padding);
+  }
+
+  GtkWidget *label = gtk_label_new(NULL);
+  gtk_label_set_markup(GTK_LABEL(label), markup);
+  gtk_box_pack_start(GTK_BOX(mhbox), label, TRUE, TRUE, padding);
+
+  if(padding)
+  {
+    gtk_box_pack_start(GTK_BOX(mhbox),
+                       gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_GUI_BOX_SPACING), TRUE, TRUE, padding);
+  }
+
+  GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_GUI_BOX_SPACING);
+  gtk_box_pack_start(GTK_BOX(vbox), hbox, TRUE, TRUE, 0);
+
+  _three_choice_result_t result = { .result = -1, .window = window };
+
+  GtkWidget *button;
+
+  if(first_text)
+  {
+    button = gtk_button_new_with_label(first_text);
+    result.button_first = button;
+    g_signal_connect(G_OBJECT(button), "clicked", G_CALLBACK(_three_choice_button_handler), &result);
+    gtk_box_pack_start(GTK_BOX(hbox), button, TRUE, TRUE, 0);
+  }
+
+  if(second_text)
+  {
+    button = gtk_button_new_with_label(second_text);
+    result.button_second = button;
+    g_signal_connect(G_OBJECT(button), "clicked", G_CALLBACK(_three_choice_button_handler), &result);
+    gtk_box_pack_start(GTK_BOX(hbox), button, TRUE, TRUE, 0);
+  }
+
+  if(third_text)
+  {
+    button = gtk_button_new_with_label(third_text);
+    result.button_third = button;
+    g_signal_connect(G_OBJECT(button), "clicked", G_CALLBACK(_three_choice_button_handler), &result);
+    gtk_box_pack_start(GTK_BOX(hbox), button, TRUE, TRUE, 0);
+  }
+
+  gtk_widget_show_all(window);
+  gtk_main();
+
+  return result.result;
+}
+
 char *dt_gui_show_standalone_string_dialog(const char *title, const char *markup, const char *placeholder,
                                            const char *no_text, const char *yes_text)
 {
@@ -3272,6 +3385,7 @@ GtkBox * attach_popover(GtkWidget *widget, const char *icon, GtkWidget *content)
 
   // Create the info icon button that will trigger the popover
   GtkWidget *button = gtk_menu_button_new();
+  dt_gui_add_class(button, "popover-button");
   GtkWidget *image = gtk_image_new_from_icon_name(icon, GTK_ICON_SIZE_BUTTON);
   gtk_button_set_image(GTK_BUTTON(button), image);
   gtk_widget_set_hexpand(button, FALSE);

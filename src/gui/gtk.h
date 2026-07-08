@@ -508,6 +508,10 @@ void dt_ui_notebook_set_picker_owner(GtkNotebook *notebook, gpointer owner);
 gboolean dt_gui_show_standalone_yes_no_dialog(const char *title, const char *markup, const char *no_text,
                                               const char *yes_text);
 
+// same as above, but with 3 buttons: returns 0 for first_text, 1 for second_text, 2 for third_text.
+int dt_gui_show_standalone_three_choice_dialog(const char *title, const char *markup, const char *first_text,
+                                               const char *second_text, const char *third_text);
+
 // similar to the one above. this one asks the user for some string. the hint is shown in the empty entry box
 char *dt_gui_show_standalone_string_dialog(const char *title, const char *markup, const char *placeholder,
                                            const char *no_text, const char *yes_text);
